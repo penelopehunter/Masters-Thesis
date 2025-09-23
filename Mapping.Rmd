@@ -1,0 +1,192 @@
+#Mapping 
+
+```{r}
+# Load packages
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(tigris)
+options(tigris_use_cache = TRUE)
+
+# Step 1: Prepare CORN dataset
+# Create 5-digit FIPS and compute irrigated_fraction
+CORN_summary <- CORN %>%
+  group_by(fips) %>%
+  summarize(
+    irrigated_yield = sum(irr, na.rm = TRUE),
+    rainfed_yield = sum(rainfed, na.rm = TRUE),
+    total_yield = irrigated_yield + rainfed_yield,
+    irrigated_fraction = ifelse(total_yield > 0, irrigated_yield / total_yield, NA_real_)
+  )
+
+# Step 2: Get US mainland counties
+counties_sf <- counties(cb = TRUE, class = "sf") %>%
+  filter(!STATEFP %in% c("02", "15", "72", "78", "60", "66", "69"))  # Remove AK, HI, PR, territories
+states_sf <- states(cb = TRUE, class = "sf") %>%
+  filter(!STATEFP %in% c("02", "15", "72", "78", "60", "66", "69"))
+
+# Step 3: Join shapefile with CORN data
+map_data <- counties_sf %>%
+  mutate(fips = GEOID) %>%
+  left_join(CORN_summary, by = "fips")
+
+# Step 4: Plot with reversed gradient and state borders
+ Irrigated_CORN_map <-ggplot() +
+  geom_sf(data = map_data, aes(fill = irrigated_fraction), color = NA) +
+  geom_sf(data = states_sf, fill = NA, color = "black", size = 0.3) +  # State outlines
+  scale_fill_gradientn(
+    colors = c("red", "gold", "#4cbb17"),  # Reversed: red = low irrigated, green = high
+    na.value = "gray90",
+    limits = c(0, 1),
+    name = "Irrigated Fraction"
+  ) +
+  labs(title = "Fraction of Irrigated to Rainfed Corn Crops by County") +
+  theme_linedraw() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  ) +
+  coord_sf(datum = NA)  # Removes ocean padding
+```
+
+```{r}
+  # === 1. Load Required Packages ===
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(tigris)
+options(tigris_use_cache = TRUE)
+
+
+# === 2. Download Shapefiles Once (Contiguous US Only) ===
+mainland_counties <- tigris::counties(cb = TRUE, class = "sf") %>%
+  filter(!STATEFP %in% c("02", "15", "72", "78", "60", "66", "69"))  # Exclude AK, HI, PR, territories
+
+mainland_states <- tigris::states(cb = TRUE, class = "sf") %>%
+  filter(!STATEFP %in% c("02", "15", "72", "78", "60", "66", "69"))
+
+
+plot_irrigated_fraction_map <- function(data, crop_name = NULL, counties_sf, states_sf) {
+  # Get name of dataset if crop_name is not provided
+  if (is.null(crop_name)) {
+    crop_name <- deparse(substitute(data))
+    crop_name <- tools::toTitleCase(tolower(crop_name))  # e.g., "BARLEY" -> "Barley"
+  }
+
+  summary_df <- data %>%
+    mutate(fips = sprintf("%02d%03d", state_ansi, county_ansi)) %>%
+    group_by(fips) %>%
+    summarize(
+      irrigated_yield = sum(irr, na.rm = TRUE),
+      rainfed_yield = sum(rainfed, na.rm = TRUE),
+      total_yield = irrigated_yield + rainfed_yield,
+      irrigated_fraction = ifelse(total_yield > 0, irrigated_yield / total_yield, NA_real_)
+    )
+
+  map_data <- counties_sf %>%
+    mutate(fips = GEOID) %>%
+    left_join(summary_df, by = "fips")
+
+  plot <- ggplot() +
+    geom_sf(data = map_data, aes(fill = irrigated_fraction), color = NA) +
+    geom_sf(data = states_sf, fill = NA, color = "black", size = 0.3) +
+    scale_fill_gradientn(
+      colors = c("red", "gold", "#4cbb17"),
+      na.value = "gray80",
+      limits = c(0, 1),
+      name = "Irrigated Fraction"
+    ) +
+    labs(title = paste("Fraction of Irrigated", crop_name, "Yield by County")) +
+    theme_minimal() +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank()
+    ) +
+    coord_sf(datum = NA)
+return(plot)
+}
+
+
+```
+
+
+```{r}
+plot_irrigated_fraction_map(CORN, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_irrigated_fraction_map(BARLEY, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_irrigated_fraction_map(SORGHUM, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_irrigated_fraction_map(SOYBEANS, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_irrigated_fraction_map(PEANUTS, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_irrigated_fraction_map(OATS, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_irrigated_fraction_map(COTTON, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_irrigated_fraction_map(WHEAT, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_irrigated_fraction_map(BEANS, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_irrigated_fraction_map(HAY, counties_sf = mainland_counties, states_sf = mainland_states)
+
+
+```
+```{r}
+# mapping years of crop present rather than irrigation factor 
+
+plot_crop_presence_years_map <- function(data, crop_name = NULL, counties_sf, states_sf) {
+  # Get name of dataset if crop_name is not provided
+  if (is.null(crop_name)) {
+    crop_name <- deparse(substitute(data))
+    crop_name <- tools::toTitleCase(tolower(crop_name))  # e.g., "barley_data" -> "Barley"
+  }
+
+  # Prepare summary: count number of unique years crop is present per county
+  summary_df <- data %>%
+    mutate(fips = sprintf("%02d%03d", state_ansi, county_ansi)) %>%
+    group_by(fips) %>%
+    summarize(
+      years_present = n_distinct(year[!is.na(irr) | !is.na(rainfed)])
+    )
+
+  # Merge with shapefile
+  map_data <- counties_sf %>%
+    mutate(fips = GEOID) %>%
+    left_join(summary_df, by = "fips")
+
+  # Plot map
+  plot <- ggplot() +
+    geom_sf(data = map_data, aes(fill = years_present), color = NA) +
+    geom_sf(data = states_sf, fill = NA, color = "black", size = 0.3) +
+    scale_fill_viridis_c(
+      option = "viridis",
+      direction = -1,
+      na.value = "gray90",
+      name = "Years Documented"
+    ) +
+    labs(title = paste("Number of Years", crop_name, "Was Documented by County")) +
+    theme_minimal() +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank()
+    ) +
+    coord_sf(datum = NA)
+
+  return(plot)
+}
+
+```
+
+
+```{r}
+
+
+plot_crop_presence_years_map(CORN, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_crop_presence_years_map(BARLEY, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_crop_presence_years_map(SORGHUM, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_crop_presence_years_map(SOYBEANS, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_crop_presence_years_map(PEANUTS, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_crop_presence_years_map(OATS, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_crop_presence_years_map(COTTON, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_crop_presence_years_map(WHEAT, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_crop_presence_years_map(BEANS, counties_sf = mainland_counties, states_sf = mainland_states)
+plot_crop_presence_years_map(HAY, counties_sf = mainland_counties, states_sf = mainland_states)
+
+```
+
