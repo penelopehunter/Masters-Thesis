@@ -19,7 +19,8 @@ packages <- c(
   "data.table",
   "knitr",
   "readr",
-  "tools"
+  "tools",
+  "stringr"
 )
 
 # Install & load all packages

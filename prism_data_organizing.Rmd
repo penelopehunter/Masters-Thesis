@@ -16,6 +16,25 @@ source("~/Desktop/ASCI-GitHub/Masters-Thesis/setup.R")
 #The following section creates a dataset of PRISM Climate Variables if your computer can handle loading in the whole dataset please skip to optional section 2.0
 
 #1.1 Loading Data
+
+```{r}
+# Define the folder path
+data_folder <- "input_data/LDAS_SM_0_10"
+
+# List all CSV files in the folder
+all_files <- list.files(path = data_folder, pattern = "\\.csv$", full.names = TRUE)
+
+# Filter files for years <= 2018
+files_to_load <- all_files %>%
+  grep(pattern = "_19[8-9][0-9]\\.csv$|_200[0-9]\\.csv$|_201[0-8]\\.csv$", value = TRUE)
+
+# Read and combine all selected files into one data frame
+ldas_soil_moisture <- lapply(files_to_load, read.csv) %>%
+  bind_rows()
+
+```
+
+
 ```{r}
 #Loading the climate variable data from PRISM data 
 ppt_county_full <- readRDS("input_data/prism_data_full/ppt_county_full.rds")
@@ -56,6 +75,13 @@ for (i in seq_along(prism_datasets)) {
   assign(dataset_names[i], df, envir = .GlobalEnv)
 }
 
+ldas_soil_moisture <- ldas_soil_moisture %>%
+  mutate(
+    time = as.Date(time),   # Convert time from character to Date
+    GEOID = as.character(GEOID),
+    SM = var                # Rename var to SM
+  ) %>%
+  select(GEOID, time, SM)   # Keep only relevant columns    
 ```
 
 #1.3 Merge PRISM Dataset
@@ -67,7 +93,8 @@ merged_prism_full <- tmax_county_full %>%
   full_join(ppt_county_full, by = c("time", "GEOID")) %>%
   full_join(vpdmax_county_full, by = c("time", "GEOID")) %>%
   full_join(vpdmean_county_full, by = c("time", "GEOID")) %>%
-  full_join(vpdmin_county_full, by = c("time", "GEOID"))
+  full_join(vpdmin_county_full, by = c("time", "GEOID")) %>% 
+  full_join(ldas_soil_moisture, by = c("time", "GEOID"))   
 
 merged_prism_full_1 <- merged_prism_full
 
@@ -80,7 +107,7 @@ saveRDS(merged_prism_full_1,"/Users/pennyhunter/Desktop/ASCI-GitHub/Masters-Thes
 #merged_prism_full_1 <- readRDS("Masters-Thesis/input_data/merged_prism_full_1.RDS")
 ```
 
-
+#Penny I stopped here at 10/29/25 20:44PM
 #3.0 Anomalies 
 ## The following section takes the PRISM Climate Variables and Soil Moisture data and calculates the average anomaly by county for each variable. Then the data is resampled with a boostrap to ...
 
@@ -99,12 +126,18 @@ merged_prism_full_1$moving_avg_vpdmean <- rollapply(merged_prism_full_1$prism_vp
 merged_prism_full_1$anomaly_vpdmean <- merged_prism_full_1$prism_vpdmean - merged_prism_full_1$moving_avg_vpdmean
 #changing mocing average from 15 to 30 days 
 merged_prism_full_1$moving_avg_ppt <- rollapply(merged_prism_full_1$prism_ppt, width = 30, FUN = mean, align = 'center', fill = NA)
-#now anamoly
+# now anamoly
 merged_prism_full_1$anomaly_ppt <- merged_prism_full_1$prism_ppt - merged_prism_full_1$moving_avg_ppt
 #changing mocing average from 15 to 30 days 
 merged_prism_full_1$moving_avg_tmax <- rollapply(merged_prism_full_1$prism_tmax, width = 30, FUN = mean, align = 'center', fill = NA)
 #now anamoly
 merged_prism_full_1$anomaly_tmax <- merged_prism_full_1$prism_tmax - merged_prism_full_1$moving_avg_tmax
+# --- Soil Moisture Anomaly (formatted same as PRISM) ---
+# 30-day moving average of soil moisture (centered)
+merged_prism_full_1$moving_avg_SM <- rollapply(merged_prism_full_1$SM, width = 30, FUN = mean, align = "center",fill = NA)
+# Anomaly = actual - moving average
+merged_prism_full_1$anomaly_SM <- merged_prism_full_1$SM - merged_prism_full_1$moving_avg_SM
+
 ```
 
 #3.2 Making the binary hot day variables for later use
@@ -114,6 +147,7 @@ merged_prism_full_1$binary_30 <- ifelse(!is.na(merged_prism_full_1$prism_tmax) &
 merged_prism_full_1$binary_32 <- ifelse(!is.na(merged_prism_full_1$prism_tmax) & merged_prism_full_1$prism_tmax >= 32, 1, 0)
 #colnames(merged_prism_full_1)
 ```
+
 #3.3 Set up the KDD and GDD calculation for the PRISM dataset
 ```{r}
 # --- Set threshold and hourly temperature profile ---
@@ -304,7 +338,10 @@ for (var in anomaly_vars) {
 #4.1 Making a yearly dataframe out of PRISM climate data set
 ```{r}
 # Summarize the dataset by GEOID and year
+
+
 merged_prism_yearly <- merged_prism_full_1 %>%
+  filter(month(time) %in% 5:9) %>%  # ✅ Filter for May (5) to September (9)
   select(-time, -binary_30, -KDD, -GDD) %>%  # Remove unwanted columns
   group_by(GEOID, year) %>%
   summarise(
@@ -315,10 +352,10 @@ merged_prism_yearly <- merged_prism_full_1 %>%
     prism_vpdmax = mean(prism_vpdmax, na.rm = TRUE),
     prism_vpdmin = mean(prism_vpdmin, na.rm = TRUE),
     prism_ppt = sum(prism_ppt, na.rm = TRUE),
-    KDD_sum_yearly = first(KDD_sum_yearly),  # Already pre-summed, just take the first value
-    GDD_sum_yearly = first(GDD_sum_yearly),  # Same here
-   # county = first(county_name),
-    .groups = 'drop'  # Ensure groups are dropped after summarizing
+    KDD_sum_yearly = first(KDD_sum_yearly),  # Already pre-summed
+    GDD_sum_yearly = first(GDD_sum_yearly),
+    # county = first(county_name),
+    .groups = 'drop'
   )
 
 ```
@@ -344,16 +381,16 @@ prism_SOYBEANS <- merge(SOYBEANS, merged_prism_yearly, by.x = c("fips", "year"),
 #4.4 OPTIONAL: Filter for counties with 20 or more years of historical data
 ```{r}
 # Filter prism_SOYBEANS
-prism_SOYBEANS <- prism_SOYBEANS %>%
-  group_by(fips) %>%
-  filter(n_distinct(year) >= 20) %>%
-  ungroup()
+#prism_SOYBEANS <- prism_SOYBEANS %>%
+ # group_by(fips) %>%
+ # filter(n_distinct(year) >= 20) %>%
+#  ungroup()
 
 # Filter prism_CORN
-prism_CORN <- prism_CORN %>%
-  group_by(fips) %>%
-  filter(n_distinct(year) >= 20) %>%
-  ungroup()
+#prism_CORN <- prism_CORN %>%
+#  group_by(fips) %>%
+#  filter(n_distinct(year) >= 20) %>%
+#  ungroup()
 ```
 
 #4.5 Convert county variable to a factor for later use
@@ -362,6 +399,9 @@ prism_CORN <- prism_CORN %>%
 prism_SOYBEANS$county_factor <- as.factor(prism_SOYBEANS$fips) #repeat for corn
 
 prism_CORN$county_factor <- as.factor(prism_CORN$fips) #repeat for corn
+
+prism_CORN <- prism_CORN %>% 
+  filter(util_practice_desc == "GRAIN")
 ```
 
 #4.6 Run Linear Regressions for irrigated and rainfed yield for each crop

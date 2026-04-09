@@ -4,3 +4,8 @@
 .Ruserdata
 *.csv
 *.csv
+# macOS junk
+.DS_Store
+
+# data folder
+input_data/

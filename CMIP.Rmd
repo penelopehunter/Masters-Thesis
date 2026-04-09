@@ -1,0 +1,531 @@
+---
+title: "CMIP"
+author: "Penny Hunter"
+date: "2025-11-21"
+output: html_document
+---
+# Setup packages
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("~/Desktop/ASCI-GitHub/Masters-Thesis/setup.R")
+```
+
+```{r}
+install.packages("arrow")
+library(arrow)
+CMIP_GFDL_ESM4_ssp245 <- read_parquet("input_data/all_GFDL-ESM4_ssp245_bc.parquet")
+```
+
+```{r}
+library(arrow)
+library(dplyr)
+library(lubridate)
+library(stringr)
+
+
+CMIP_GFDL_ESM4_ssp245 <-CMIP_GFDL_ESM4_ssp245 %>%
+  mutate(
+    time = as.Date(time),
+    doy  = yday(time),
+    state_id = as.integer(str_sub(GEOID, 1, 2)),
+    tmax = tasmax,    # rename to match PRISM pipeline
+    tmin = tasmin,
+    ppt  = pr          # precipitation in mm/day
+  )
+```
+
+```{r}
+#if data not loaded go ahead and load 
+maize_gs <- readRDS("input_data/maize_gs")
+soybeans_gs <- readRDS("input_data/soybeans_gs")
+```
+
+```{r}
+maize_gs <- maize_gs %>% select(-`...1`)
+soybeans_gs <- soybeans_gs %>% select(-`...1`)
+```
+
+
+
+
+```{r}
+# CMIP input is daily
+CMIP <- CMIP_GFDL_ESM4_ssp245 %>%
+  mutate(
+    year = year(time),
+    doy  = yday(time),
+    state_id = as.integer(str_sub(GEOID, 1, 2)),
+    prism_tmax = tmax,   # rename to match regression inputs
+    prism_tmin = tmin,
+    prism_ppt  = ppt,
+    prism_vpdmean = daily_mean_vpd_tdew_bc_temp
+  )
+rm(CMIP_GFDL_ESM4_ssp245)
+```
+
+```{r}
+maize_median <- read_csv("input_data/maize_median.csv")
+soybeans_median <- read_csv("input_data/soybeans_median.csv")
+
+# Maize
+maize_condensed <- maize_median %>%
+  select(state_name, state_id, growing_phase, start_doy) %>%
+  filter(growing_phase %in% c("EMERGED", "HARVESTED")) %>%
+  pivot_wider(
+    names_from = growing_phase,
+    values_from = start_doy
+  ) %>%
+  rename(
+    emerged = EMERGED,
+    harvested = HARVESTED
+  )
+
+# Soybeans
+soybeans_condensed <- soybeans_median %>%
+  select(state_name, state_id, growing_phase, start_doy) %>%
+  filter(growing_phase %in% c("EMERGED", "HARVESTED")) %>%
+  pivot_wider(
+    names_from = growing_phase,
+    values_from = start_doy
+  ) %>%
+  rename(
+    emerged = EMERGED,
+    harvested = HARVESTED
+  )
+
+```
+
+```{r}
+CMIP_maize <- CMIP %>%
+  left_join(maize_condensed, by = "state_id") %>%
+  filter(doy >= emerged & doy <= harvested)
+
+CMIP_soy <- CMIP %>%
+  left_join(soybeans_condensed, by = "state_id") %>%
+  filter(doy >= emerged & doy <= harvested)
+rm(CMIP)
+rm(CMIP_GFDL_ESM4_ssp245)
+rm(maize_condensed)
+rm(soybeans_condensed)
+rm(soybeans_median)
+rm(maize_median)
+```
+
+
+
+
+```{r}
+library(dplyr)
+library(purrr)
+
+# Row-wise KDD function
+row_KDD <- function(tmax, tmin, thr = 30) {
+  # hourly fraction
+  Tf <- 0.44 - 0.46 * sin((pi * seq(0.5, 23, 1)) / 12 + 0.9) +
+        0.11 * sin((2 * pi * seq(0.5, 23, 1)) / 12 + 0.9)
+  hrlyT <- tmax * Tf + tmin * (1 - Tf)
+  sum(pmax(hrlyT - thr, 0)) / 24
+}
+
+# Row-wise GDD function
+row_GDD <- function(tmax, tmin, base = 5, cap = 30) {
+  tmax <- pmin(tmax, cap)
+  tmin <- pmax(tmin, base)
+  Tf <- 0.44 - 0.46 * sin((pi * seq(0.5, 23, 1)) / 12 + 0.9) +
+        0.11 * sin((2 * pi * seq(0.5, 23, 1)) / 12 + 0.9)
+  hrlyT <- tmax * Tf + tmin * (1 - Tf)
+  sum(pmax(hrlyT - base, 0)) / 24
+}
+
+# Apply using purrr::pmap_dbl for speed
+CMIP_maize <- CMIP_maize %>%
+  mutate(
+    KDD = pmap_dbl(list(prism_tmax, prism_tmin), row_KDD),
+    GDD = pmap_dbl(list(prism_tmax, prism_tmin), row_GDD)
+  )
+
+CMIP_soy <- CMIP_soy %>%
+  mutate(
+    KDD = pmap_dbl(list(prism_tmax, prism_tmin), row_KDD),
+    GDD = pmap_dbl(list(prism_tmax, prism_tmin), row_GDD)
+  )
+
+
+```
+
+```{r}
+
+library(dplyr)
+
+# For maize
+CMIP_maize_season <- CMIP_maize %>%
+  group_by(state_id, year) %>%   # change/add grouping columns if needed
+  summarise(
+    avg_tmax = mean(prism_tmax, na.rm = TRUE),
+    avg_tmin = mean(prism_tmin, na.rm = TRUE),
+    avg_temp = mean((prism_tmax + prism_tmin)/2, na.rm = TRUE), # optional mean daily temp
+    total_precip = sum(precip, na.rm = TRUE),
+    total_GDD = sum(GDD, na.rm = TRUE),
+    total_KDD = sum(KDD, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# For soy
+CMIP_soy_season <- CMIP_soy %>%
+  group_by(state_id, year) %>%
+  summarise(
+    avg_tmax = mean(prism_tmax, na.rm = TRUE),
+    avg_tmin = mean(prism_tmin, na.rm = TRUE),
+    avg_temp = mean((prism_tmax + prism_tmin)/2, na.rm = TRUE),
+    total_precip = sum(precip, na.rm = TRUE),
+    total_GDD = sum(GDD, na.rm = TRUE),
+    total_KDD = sum(KDD, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+
+
+
+```
+
+```{r}
+#filter for only counties in the yield model 
+counties_combined <- readRDS("input_data/counties_combined.rds")
+
+
+```
+
+
+```{r}
+
+
+
+# Keep only GEOIDs present in the counties dataset
+counties_combined<- unique(counties_combined$fips)
+
+# Aggregate CMIP maize data
+CMIP_maize_season <- CMIP_maize %>%
+  filter(GEOID %in% counties_combined) %>%  # only counties present in training
+  group_by(GEOID, year) %>%             # group by county and year
+  summarise(
+    GDD_sum = sum(GDD, na.rm = TRUE),
+    KDD_sum = sum(KDD, na.rm = TRUE),
+    precip_sum = sum(precip, na.rm = TRUE),
+    tmax_avg = mean(prism_tmax, na.rm = TRUE),
+    tmin_avg = mean(prism_tmin, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+CMIP_soy_season <- CMIP_soy %>% 
+  filter(GEOID %in% counties_combined) %>%  # only counties present in training
+  group_by(GEOID, year) %>%             # group by county and year
+  summarise(
+    GDD_sum = sum(GDD, na.rm = TRUE),
+    KDD_sum = sum(KDD, na.rm = TRUE),
+    precip_sum = sum(precip, na.rm = TRUE),
+    tmax_avg = mean(prism_tmax, na.rm = TRUE),
+    tmin_avg = mean(prism_tmin, na.rm = TRUE),
+    .groups = "drop"
+  )
+rm(CMIP_soy)
+rm(CMIP_maize)
+```
+
+```{r}
+#  Define formula
+
+yield_formula <- function(crop_type) {
+  as.formula(paste0(
+    crop_type, " ~ KDD_sum_yearly + GDD_sum_yearly + prism_ppt + ",
+    "year:county_factor + I(year^2):county_factor"
+  ))
+}
+
+#  Recreate models
+# Maize - Irrigated
+maize_irrigated_model <- lm(
+  formula = yield_formula("irr"),
+  data = maize_gs  # replace with your training dataset for maize irrigated
+)
+
+# Maize - Rainfed
+maize_rainfed_model <- lm(
+  formula = yield_formula("rainfed"),
+  data = maize_gs  # replace with your training dataset for maize rainfed
+)
+
+# Soy - Irrigated
+soy_irrigated_model <- lm(
+  formula = yield_formula("irr"),
+  data = soybeans_gs    # replace with your training dataset for soy irrigated
+)
+
+# Soy - Rainfed
+soy_rainfed_model <- lm(
+  formula = yield_formula("rainfed"),
+  data = soybeans_gs    # replace with your training dataset for soy rainfed
+)
+
+```
+
+#replace once saved 
+```{r}
+# Maize
+maize_irrigated_model <- readRDS("input_data/model_maize_irr.rds")
+maize_rainfed_model  <- readRDS("input_data/model_maize_rain.rds")
+
+# Soybean
+soy_irrigated_model <- readRDS("input_data/model_soy_irr.rds")
+soy_rainfed_model  <- readRDS("input_data/model_soy_rain.rds")
+```
+
+```{r}
+
+CMIP_maize_season <- CMIP_maize_season %>%
+  dplyr::rename(
+    prism_tmax     = tmax_avg,
+    prism_tmin     = tmin_avg,
+    prism_ppt      = precip_sum,
+    GDD_sum_yearly = GDD_sum,
+    KDD_sum_yearly = KDD_sum
+  )
+
+CMIP_soy_season <- CMIP_soy_season %>%
+  dplyr::rename(
+    prism_tmax     = tmax_avg,
+    prism_tmin     = tmin_avg,
+    prism_ppt      = precip_sum,
+    GDD_sum_yearly = GDD_sum,
+    KDD_sum_yearly = KDD_sum
+  )
+
+# Create county factor
+
+CMIP_maize_season$county_factor <- factor(CMIP_maize_season$GEOID)
+CMIP_soy_season$county_factor   <- factor(CMIP_soy_season$GEOID)
+
+
+
+
+
+```
+```{r}
+# Make sure county_factor is factor
+maize_gs$county_factor <- factor(maize_gs$county_factor)
+maize_gs$county_factor <- factor(maize_gs$county_factor)
+
+# 2. Refit model without county_factor
+maize_irrigated_model <- lm(
+  irr ~ KDD_sum_yearly + GDD_sum_yearly + prism_ppt + year + I(year^2),
+  data = maize_gs
+)
+
+maize_rainfed_model <- lm(
+  rainfed ~ KDD_sum_yearly + GDD_sum_yearly + prism_ppt + year + I(year^2),
+  data = maize_gs
+)
+
+# 3. Predict
+CMIP_maize_season$pred_yield_irrigated <- predict(maize_irrigated_model, newdata = CMIP_maize_season)
+CMIP_maize_season$pred_yield_rainfed  <- predict(maize_rainfed_model,  newdata = CMIP_maize_season)
+
+# 4. Check predictions
+summary(CMIP_maize_season$pred_yield_irrigated)
+sum(is.na(CMIP_maize_season$pred_yield_irrigated))  # should be 0
+
+```
+
+```{r}
+
+# 2. Refit models without county_factor
+soy_irrigated_model <- lm(
+  irr ~ KDD_sum_yearly + GDD_sum_yearly + prism_ppt + year + I(year^2),
+  data = soybeans_gs
+)
+
+soy_rainfed_model <- lm(
+  rainfed ~ KDD_sum_yearly + GDD_sum_yearly + prism_ppt + year + I(year^2),
+  data = soybeans_gs
+)
+
+# 3. Predict yields for CMIP data
+CMIP_soy_season$pred_yield_irrigated <- predict(soy_irrigated_model, newdata = CMIP_soy_season)
+CMIP_soy_season$pred_yield_rainfed  <- predict(soy_rainfed_model,  newdata = CMIP_soy_season)
+
+# 4. Check predictions
+summary(CMIP_soy_season$pred_yield_irrigated)
+sum(is.na(CMIP_soy_season$pred_yield_irrigated))  # should be 0
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# 1. Aggregate to get mean predicted yield per year
+maize_mean <- CMIP_maize_season %>%
+  group_by(year) %>%
+  summarise(
+    mean_irrigated = mean(pred_yield_irrigated, na.rm = TRUE),
+    mean_rainfed = mean(pred_yield_rainfed, na.rm = TRUE)
+  )
+
+soy_mean <- CMIP_soy_season %>%
+  group_by(year) %>%
+  summarise(
+    mean_irrigated = mean(pred_yield_irrigated, na.rm = TRUE),
+    mean_rainfed = mean(pred_yield_rainfed, na.rm = TRUE)
+  )
+
+# 2. Plot maize yields over time
+ggplot(maize_mean, aes(x = year)) +
+  geom_line(aes(y = mean_irrigated, color = "Irrigated")) +
+  geom_line(aes(y = mean_rainfed, color = "Rainfed")) +
+  labs(
+    title = "Predicted Maize Yields Over Time",
+    y = "Yield",
+    color = "Management"
+  ) +
+  theme_minimal()
+
+# 3. Plot soy yields over time
+ggplot(soy_mean, aes(x = year)) +
+  geom_line(aes(y = mean_irrigated, color = "Irrigated")) +
+  geom_line(aes(y = mean_rainfed, color = "Rainfed")) +
+  labs(
+    title = "Predicted Soy Yields Over Time",
+    y = "Yield",
+    color = "Management"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r}
+# -----------------------------
+# Fix county factor levels
+# -----------------------------
+
+# Maize
+CMIP_maize_season$county_factor <- factor(
+  CMIP_maize_season$GEOID,
+  levels = levels(maize_irrigated_model$model$county_factor)  # match training factor levels
+)
+
+# Soy
+CMIP_soy_season$county_factor <- factor(
+  CMIP_soy_season$GEOID,
+  levels = levels(soy_irrigated_model$model$county_factor)  # match training factor levels
+)
+
+# -----------------------------
+# Predict yields
+# -----------------------------
+
+# Maize
+CMIP_maize_season$pred_yield_irrigated <- predict(
+  maize_irrigated_model, 
+  newdata = CMIP_maize_season
+)
+
+CMIP_maize_season$pred_yield_rainfed <- predict(
+  maize_rainfed_model, 
+  newdata = CMIP_maize_season
+)
+
+# Soy
+CMIP_soy_season$pred_yield_irrigated <- predict(
+  soy_irrigated_model, 
+  newdata = CMIP_soy_season
+)
+
+CMIP_soy_season$pred_yield_rainfed <- predict(
+  soy_rainfed_model, 
+  newdata = CMIP_soy_season
+)
+
+```
+
+
+```{r}
+CMIP_maize_yearly <- CMIP_maize %>%
+  group_by(GEOID, year) %>%
+  summarise(
+    prism_tmax = mean(prism_tmax, na.rm = TRUE),
+    prism_tmin = mean(prism_tmin, na.rm = TRUE),
+    prism_vpdmean = mean(prism_vpdmean, na.rm = TRUE),
+    prism_vpdmax = mean(prism_vpdmax, na.rm = TRUE),
+    prism_vpdmin = mean(prism_vpdmin, na.rm = TRUE),
+    prism_ppt  = sum(prism_ppt, na.rm = TRUE),
+    KDD_sum_yearly = sum(KDD, na.rm = TRUE),
+    GDD_sum_yearly = sum(GDD, na.rm = TRUE),
+    county_factor = as.factor(str_sub(GEOID, 3, 5)),
+    state_factor  = as.factor(str_sub(GEOID, 1, 2)),
+    .groups = "drop"
+  )
+
+CMIP_soy_yearly <- CMIP_soy %>%
+  group_by(GEOID, year) %>%
+  summarise(
+    prism_tmax = mean(prism_tmax, na.rm = TRUE),
+    prism_tmin = mean(prism_tmin, na.rm = TRUE),
+    prism_vpdmean = mean(prism_vpdmean, na.rm = TRUE),
+    prism_vpdmax = mean(prism_vpdmax, na.rm = TRUE),
+    prism_vpdmin = mean(prism_vpdmin, na.rm = TRUE),
+    prism_ppt  = sum(prism_ppt, na.rm = TRUE),
+    KDD_sum_yearly = sum(KDD, na.rm = TRUE),
+    GDD_sum_yearly = sum(GDD, na.rm = TRUE),
+    county_factor = as.factor(str_sub(GEOID, 3, 5)),
+    state_factor  = as.factor(str_sub(GEOID, 1, 2)),
+    .groups = "drop"
+  )
+
+```
+
+
+#linear models
+```{r}
+model_maize_irr <- lm(
+  irr ~ prism_tmax + prism_tmin + prism_ppt +
+    prism_vpdmean + KDD_sum_yearly + GDD_sum_yearly +
+    county_factor + state_factor,
+  data = maize_gs
+)
+
+
+model_maize_rain <- lm(
+  rainfed ~ prism_tmax + prism_tmin + prism_ppt +
+    prism_vpdmean + KDD_sum_yearly + GDD_sum_yearly +
+    county_factor + state_factor,
+  data = maize_gs
+)
+
+
+model_soy_irr <- lm(
+  irr ~ prism_tmax + prism_tmin + prism_ppt +
+    prism_vpdmean + KDD_sum_yearly + GDD_sum_yearly +
+    county_factor + state_factor,
+  data = soybeans_gs
+)
+
+
+model_soy_rain <- lm(
+  rainfed ~ prism_tmax + prism_tmin + prism_ppt +
+    prism_vpdmean + KDD_sum_yearly + GDD_sum_yearly +
+    county_factor + state_factor,
+  data = soybeans_gs
+)
+
+```
+
+```{r}
+saveRDS(model_maize_irr, "input_data/model_maize_irr.rds")
+saveRDS(model_maize_rain, "input_data/model_maize_rain.rds")
+saveRDS(model_soy_irr,   "input_data/model_soy_irr.rds")
+saveRDS(model_soy_rain,  "input_data/model_soy_rain.rds")
+```
+
+C
+
+
