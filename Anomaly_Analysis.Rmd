@@ -1,0 +1,462 @@
+---
+title: "Climate Anomalies Around Hot Days: Post-Defense Analysis"
+author: "Penny Hunter"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+source("~/Desktop/ASCI-GitHub/Masters-Thesis/setup.R")
+```
+
+---
+
+## Overview
+
+This script constructs daily climate anomalies relative to a smoothed
+day-of-year climatology and estimates how soil moisture, temperature, VPD,
+and precipitation in the 30-day window around hot days (Tmax ≥ 30°C).
+Inference is based on a state-year block bootstrap (1,000 replications) to
+account for spatial and temporal dependence.
+
+Pipeline:
+
+1. Load LDAS soil moisture and PRISM climate data
+2. Merge all variables into a single daily county-level panel
+3. Compute smoothed DOY climatology and daily anomalies
+4. Identify hot days and run the bootstrap
+5. Plot results
+
+---
+
+## 1. Load LDAS Soil Moisture Data
+
+LDAS soil moisture is available at three depth layers. Files are filtered to
+the historical period (1980–2018).
+
+```{r load-ldas}
+load_ldas_data <- function(folder_path) {
+  all_files <- list.files(path = folder_path, pattern = "\\.csv$", full.names = TRUE)
+  files_to_load <- grep(
+    pattern = "_19[8-9][0-9]\\.csv$|_200[0-9]\\.csv$|_201[0-8]\\.csv$",
+    x       = all_files,
+    value   = TRUE
+  )
+  lapply(files_to_load, read.csv) |> dplyr::bind_rows()
+}
+
+ldas_sm_0_10   <- load_ldas_data("input_data/LDAS_SM_0_10")
+ldas_sm_10_40  <- load_ldas_data("input_data/LDAS_SM_10_40")
+ldas_sm_40_100 <- load_ldas_data("input_data/LDAS_SM_40_100")
+```
+
+---
+
+## 2. Load PRISM Climate Data
+
+```{r load-prism}
+ppt_county_full     <- readRDS("input_data/prism_data_full/ppt_county_full.rds")
+tmin_county_full    <- readRDS("input_data/prism_data_full/tmin_county_full.rds")
+tmax_county_full    <- readRDS("input_data/prism_data_full/tmax_county_full.rds")
+vpdmin_county_full  <- readRDS("input_data/prism_data_full/vpdmin_county_full.rds")
+vpdmean_county_full <- readRDS("input_data/prism_data_full/vpdmean_county_full.rds")
+vpdmax_county_full  <- readRDS("input_data/prism_data_full/vpdmax_county_full.rds")
+```
+
+---
+
+## 3. Prepare and Merge All Variables
+
+Drop redundant identifier columns from PRISM datasets, standardize LDAS
+column names and GEOID formatting, then join all variables into a single
+daily panel.
+
+```{r prep-and-merge}
+# Drop redundant columns from PRISM datasets
+prism_datasets <- list(
+  tmin_county_full, ppt_county_full,
+  vpdmax_county_full, vpdmin_county_full, vpdmean_county_full
+)
+dataset_names  <- c(
+  "tmin_county_full", "ppt_county_full",
+  "vpdmax_county_full", "vpdmin_county_full", "vpdmean_county_full"
+)
+cols_to_remove <- c("county_name", "county_count", "Year", "Month", "Day")
+
+for (i in seq_along(prism_datasets)) {
+  df <- prism_datasets[[i]]
+  df <- df[, !(names(df) %in% cols_to_remove)]
+  assign(dataset_names[i], df, envir = .GlobalEnv)
+}
+
+# Standardize LDAS layers
+prep_ldas <- function(df, col_name) {
+  df %>%
+    mutate(
+      time  = as.Date(time),
+      GEOID = stringr::str_pad(as.character(GEOID), width = 5, pad = "0"),
+      !!col_name := var
+    ) %>%
+    select(GEOID, time, all_of(col_name))
+}
+
+ldas_sm_0_10   <- prep_ldas(ldas_sm_0_10,   "SM_0_10")
+ldas_sm_10_40  <- prep_ldas(ldas_sm_10_40,  "SM_10_40")
+ldas_sm_40_100 <- prep_ldas(ldas_sm_40_100, "SM_40_100")
+
+# Merge all variables
+merged_prism_full <- tmax_county_full %>%
+  full_join(tmin_county_full,    by = c("time", "GEOID")) %>%
+  full_join(ppt_county_full,     by = c("time", "GEOID")) %>%
+  full_join(vpdmax_county_full,  by = c("time", "GEOID")) %>%
+  full_join(vpdmean_county_full, by = c("time", "GEOID")) %>%
+  full_join(vpdmin_county_full,  by = c("time", "GEOID")) %>%
+  full_join(ldas_sm_0_10,        by = c("time", "GEOID")) %>%
+  full_join(ldas_sm_10_40,       by = c("time", "GEOID")) %>%
+  full_join(ldas_sm_40_100,      by = c("time", "GEOID"))
+
+merged_prism_full_1 <- merged_prism_full
+
+rm(merged_prism_full, ppt_county_full, vpdmax_county_full, vpdmean_county_full,
+   vpdmin_county_full, tmin_county_full, tmax_county_full,
+   ldas_sm_0_10, ldas_sm_10_40, ldas_sm_40_100, prism_datasets, df)
+
+saveRDS(
+  merged_prism_full_1,
+  "/Users/pennyhunter/Desktop/ASCI-GitHub/Masters-Thesis/input_data/merged_prism_full_1_wldas.RDS"
+)
+# merged_prism_full_1 <- readRDS("input_data/merged_prism_full_1_wldas.RDS")
+```
+
+```{r filter-counties}
+# Restrict to counties present in the yield analysis
+counties_combined   <- readRDS("input_data/counties_combined.rds")
+merged_prism_full_1 <- merged_prism_full_1 %>%
+  filter(GEOID %in% counties_combined$fips)
+rm(counties_combined)
+```
+
+---
+
+## 4. Compute DOY Climatology and Daily Anomalies
+
+A smoothed day-of-year (DOY) climatology is computed for each county using a
+±7-day centred running mean. Anomalies are then calculated as observed minus
+climatological values.
+
+```{r compute-anomalies}
+library(slider)
+
+clim_vars <- c(
+  "prism_vpdmax", "prism_vpdmin", "prism_vpdmean",
+  "prism_ppt", "prism_tmax", "prism_tmin",
+  "SM_0_10", "SM_10_40", "SM_40_100"
+)
+
+merged_prism_full_1 <- merged_prism_full_1 %>%
+  mutate(doy = lubridate::yday(time))
+
+# Raw DOY climatology (county × DOY mean across all years)
+doy_clim <- merged_prism_full_1 %>%
+  group_by(GEOID, doy) %>%
+  summarise(across(all_of(clim_vars),
+                   ~ mean(.x, na.rm = TRUE),
+                   .names = "clim_{.col}"),
+            .groups = "drop")
+
+# Smooth with a ±7-day centred running mean
+doy_clim <- doy_clim %>%
+  group_by(GEOID) %>%
+  arrange(doy, .by_group = TRUE) %>%
+  mutate(across(
+    starts_with("clim_"),
+    ~ slide_dbl(.x, ~ mean(.x, na.rm = TRUE),
+                .before = 7, .after = 7, .complete = FALSE)
+  )) %>%
+  ungroup()
+
+# Compute anomalies
+merged_prism_full_1 <- merged_prism_full_1 %>%
+  left_join(doy_clim, by = c("GEOID", "doy")) %>%
+  mutate(
+    anomaly_vpdmax    = prism_vpdmax  - clim_prism_vpdmax,
+    anomaly_vpdmin    = prism_vpdmin  - clim_prism_vpdmin,
+    anomaly_vpdmean   = prism_vpdmean - clim_prism_vpdmean,
+    anomaly_ppt       = prism_ppt     - clim_prism_ppt,
+    anomaly_tmax      = prism_tmax    - clim_prism_tmax,
+    anomaly_tmin      = prism_tmin    - clim_prism_tmin,
+    anomaly_SM_0_10   = SM_0_10       - clim_SM_0_10,
+    anomaly_SM_10_40  = SM_10_40      - clim_SM_10_40,
+    anomaly_SM_40_100 = SM_40_100     - clim_SM_40_100
+  )
+
+rm(doy_clim)
+```
+
+---
+
+## 5. Construct Daily GDD, KDD, and Hot Day Indicator
+
+```{r gdd-kdd}
+kdd_threshold <- 30
+gdd_base      <- 10
+gdd_cap       <- 30
+
+Tf <- 0.44 - 0.46 * sin((pi * seq(0.5, 23, 1)) / 12 + 0.9) +
+      0.11 * sin((2 * pi * seq(0.5, 23, 1)) / 12 + 0.9)
+
+calculate_kdd <- function(T_max, T_min, thr, Tf) {
+  hrlyT <- T_max * Tf + T_min * (1 - Tf)
+  sum(pmax(hrlyT - thr, 0)) / 24
+}
+
+calculate_gdd <- function(T_max, T_min, Tf, base = gdd_base, cap = gdd_cap) {
+  if (T_min < base || T_max > cap) return(0)
+  hrlyT <- T_max * Tf + T_min * (1 - Tf)
+  sum(pmax(hrlyT - base, 0)) / 24
+}
+
+merged_prism_full_1$KDD <- mapply(
+  calculate_kdd,
+  T_max    = merged_prism_full_1$prism_tmax,
+  T_min    = merged_prism_full_1$prism_tmin,
+  MoreArgs = list(thr = kdd_threshold, Tf = Tf)
+)
+
+merged_prism_full_1$GDD <- mapply(
+  calculate_gdd,
+  T_max    = merged_prism_full_1$prism_tmax,
+  T_min    = merged_prism_full_1$prism_tmin,
+  MoreArgs = list(Tf = Tf)
+)
+
+merged_prism_full_1 <- merged_prism_full_1 %>%
+  mutate(
+    year      = lubridate::year(time),
+    binary_30 = as.integer(!is.na(prism_tmax) & prism_tmax >= 30),
+    GEOID     = stringr::str_pad(as.character(GEOID), width = 5, pad = "0"),
+    state     = substr(GEOID, 1, 2)
+  ) %>%
+  group_by(GEOID, year) %>%
+  mutate(
+    KDD_sum_yearly = sum(KDD, na.rm = TRUE),
+    GDD_sum_yearly = sum(GDD, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+saveRDS(
+  merged_prism_full_1,
+  "/Users/pennyhunter/Desktop/ASCI-GitHub/Masters-Thesis/input_data/merged_prism_full_1_wldas.RDS"
+)
+# merged_prism_full_1 <- readRDS("input_data/merged_prism_full_1_wldas.RDS")
+```
+
+---
+
+## 6. State-Year Block Bootstrap
+
+For each anomaly variable, KDD-weighted mean anomalies are computed in a
+±30-day window around each hot day. Confidence intervals are derived from
+1,000 state-year block bootstrap replications.
+
+```{r bootstrap, cache=TRUE}
+library(data.table)
+
+setDT(merged_prism_full_1)
+merged_all <- merged_prism_full_1
+
+hot_days <- merged_all[binary_30 == 1, .(GEOID, state, day0_date = time, KDD)]
+hot_days[, year := year(day0_date)]
+
+anomaly_vars <- c(
+  "anomaly_tmax",
+  "anomaly_vpdmax",
+  "anomaly_vpdmean",
+  "anomaly_vpdmin",
+  "anomaly_ppt",
+  "anomaly_SM_0_10",
+  "anomaly_SM_10_40",
+  "anomaly_SM_40_100"
+)
+
+day_offsets        <- -30:30
+n_boot             <- 1000
+set.seed(123)
+
+unique_state_year <- unique(hot_days[, .(state, year)])
+all_results       <- list()
+
+for (var in anomaly_vars) {
+  cat("\nProcessing:", var, "\n")
+
+  anomaly_lookup <- merged_all[, .(GEOID, time, anomaly_value = get(var))]
+
+  bootstrap_mat <- matrix(NA_real_, nrow = n_boot, ncol = length(day_offsets))
+  colnames(bootstrap_mat) <- paste0("d", day_offsets)
+
+  for (i in seq_len(n_boot)) {
+    if (i %% 50 == 0) cat("  Bootstrap", i, "of", n_boot, "\n")
+
+    sampled_blocks <- unique_state_year[sample(.N, replace = TRUE)]
+
+    hot_sample <- rbindlist(lapply(seq_len(nrow(sampled_blocks)), function(j) {
+      hot_days[state == sampled_blocks$state[j] & year == sampled_blocks$year[j]]
+    }))
+
+    boot_windows <- hot_sample[, .(offset = day_offsets), by = .(GEOID, day0_date, KDD)]
+    boot_windows[, window_date := day0_date + offset]
+
+    boot_window_data <- merge(
+      boot_windows, anomaly_lookup,
+      by.x = c("GEOID", "window_date"), by.y = c("GEOID", "time"),
+      all.x = TRUE
+    )
+
+    boot_window_data[, weighted_anomaly := anomaly_value * KDD]
+    total_kdd <- sum(hot_sample$KDD, na.rm = TRUE)
+
+    avg_by_offset <- boot_window_data[
+      !is.na(weighted_anomaly),
+      .(avg = sum(weighted_anomaly, na.rm = TRUE) / total_kdd),
+      by = offset
+    ]
+    setkey(avg_by_offset, offset)
+
+    bootstrap_mat[i, match(avg_by_offset$offset, day_offsets)] <- avg_by_offset$avg
+  }
+
+  all_results[[var]] <- data.table(
+    variable = var,
+    day      = day_offsets,
+    mean     = colMeans(bootstrap_mat, na.rm = TRUE),
+    lower    = apply(bootstrap_mat, 2, quantile, probs = 0.025, na.rm = TRUE),
+    upper    = apply(bootstrap_mat, 2, quantile, probs = 0.975, na.rm = TRUE)
+  )
+}
+
+all_boot <- rbindlist(all_results)
+
+saveRDS(
+  all_boot,
+  "/Users/pennyhunter/Desktop/ASCI-GitHub/Masters-Thesis/output_data/all_boot_STATE_YEAR.RDS"
+)
+# all_boot <- readRDS("output_data/all_boot_STATE_YEAR.RDS")
+```
+
+---
+
+## 7. Plot Bootstrap Results
+
+Individual and combined panel figures are saved at 600 dpi. Soil moisture
+panels share a common y-axis. Panels are labelled a–f.
+
+```{r plot-setup}
+library(patchwork)
+
+# Variable metadata: y-axis labels
+var_meta <- list(
+  anomaly_ppt       = list(label = "Precipitation Anomaly (mm)"),
+  anomaly_SM_0_10   = list(label = "Soil Moisture 0–10 cm Anomaly (m³/m³)"),
+  anomaly_SM_10_40  = list(label = "Soil Moisture 10–40 cm Anomaly (m³/m³)"),
+  anomaly_SM_40_100 = list(label = "Soil Moisture 40–100 cm Anomaly (m³/m³)"),
+  anomaly_tmax      = list(label = "Max Temperature Anomaly (°C)"),
+  anomaly_vpdmax    = list(label = "VPD Maximum Anomaly (hPa)")
+)
+
+# Plot order and panel letters
+plot_order   <- c(
+  "anomaly_ppt",      "anomaly_SM_0_10",
+  "anomaly_SM_10_40", "anomaly_SM_40_100",
+  "anomaly_tmax",     "anomaly_vpdmax"
+)
+plot_letters <- setNames(letters[seq_along(plot_order)], plot_order)
+
+# Shared y-axis limits for soil moisture panels
+sm_vars     <- c("anomaly_SM_0_10", "anomaly_SM_10_40", "anomaly_SM_40_100")
+all_boot_dt <- as.data.table(all_boot)
+sm_data     <- all_boot_dt[variable %in% sm_vars]
+sm_ylim     <- c(min(sm_data$lower, na.rm = TRUE), max(sm_data$upper, na.rm = TRUE))
+
+bottom_row_vars <- c("anomaly_tmax", "anomaly_vpdmax")
+```
+
+```{r plot-function}
+make_plot <- function(var, letter, ylim_fixed = NULL, show_x_axis = FALSE) {
+  dat    <- all_boot_dt[variable == var]
+  ylabel <- var_meta[[var]]$label
+
+  p <- ggplot(dat, aes(x = day)) +
+    geom_vline(xintercept = 0, linetype = "dotted",
+               color = "gray50", linewidth = 0.6) +
+    geom_ribbon(aes(ymin = lower, ymax = upper),
+                fill = "#8FBC8F", alpha = 0.45) +
+    geom_line(aes(y = mean), color = "darkgreen", linewidth = 1.1) +
+    geom_hline(yintercept = 0, linetype = "dashed",
+               color = "gray50", linewidth = 0.5) +
+    labs(
+      title = letter,
+      x     = if (show_x_axis) expression(bold("Days from Hot Day")) else NULL,
+      y     = ylabel
+    ) +
+    theme(
+      panel.grid        = element_blank(),
+      panel.border      = element_rect(color = "black", fill = NA, linewidth = 0.5),
+      plot.title        = element_text(size = 11, face = "bold", hjust = 0),
+      axis.title.y      = element_text(size = 10, face = "bold"),
+      axis.text         = element_text(size = 9),
+      axis.title.x      = if (!show_x_axis) element_blank()
+                          else element_text(size = 11, face = "bold"),
+      axis.ticks        = element_line(color = "black", linewidth = 0.4),
+      axis.ticks.length = unit(3, "pt")
+    ) +
+    scale_x_continuous(expand = c(0, 0))
+
+  if (!is.null(ylim_fixed)) p <- p + scale_y_continuous(limits = ylim_fixed)
+  return(p)
+}
+```
+
+```{r save-individual-plots}
+for (var in plot_order) {
+  p <- make_plot(
+    var,
+    letter      = plot_letters[var],
+    ylim_fixed  = if (var %in% sm_vars) sm_ylim else NULL,
+    show_x_axis = TRUE
+  )
+  fname <- paste0("output_data/", var, "_bootstrap_STATE_YEAR.png")
+  ggsave(fname, p, width = 7.5, height = 4, dpi = 600, units = "in")
+  cat("Saved:", fname, "\n")
+}
+```
+
+```{r combined-panel, fig.width=7.5, fig.height=10}
+plot_list <- lapply(plot_order, function(var) {
+  make_plot(
+    var,
+    letter      = plot_letters[var],
+    ylim_fixed  = if (var %in% sm_vars) sm_ylim else NULL,
+    show_x_axis = var %in% bottom_row_vars
+  )
+})
+
+p_all <- wrap_plots(plot_list, ncol = 2)
+print(p_all)
+
+ggsave(
+  "output_data/ALL_VARIABLES_bootstrap_STATE_YEAR.png",
+  p_all, width = 7.5, height = 10, dpi = 600, units = "in"
+)
+cat("Saved: ALL_VARIABLES_bootstrap_STATE_YEAR.png\n")
+```

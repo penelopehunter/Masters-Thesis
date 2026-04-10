@@ -1,0 +1,378 @@
+---
+title: "CMIP6 Projected Crop Yield Analysis (SSP2-4.5)"
+author: "Penny Hunter"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(arrow)
+```
+
+---
+
+## Overview
+
+This script applies historically-calibrated yield regression models to
+bias-corrected CMIP6 projections (SSP2-4.5) to estimate future maize and
+soybean yields across US Corn Belt counties through 2100. Five GCMs are used
+to represent model uncertainty.
+
+Pipeline:
+
+1. Load training data and fitted regression models
+2. Load and crop CMIP6 parquet files to analysis counties
+3. Compute daily GDD and KDD from projected temperatures
+4. Aggregate to county-year summaries
+5. Predict yields and summarize across GCMs
+6. Plot projections with GCM uncertainty envelope
+7. Compute start-to-end yield changes
+
+---
+
+## 1. Load Training Data and Fitted Models
+
+County factor levels must match those used during model training.
+
+```{r load-data-models}
+maize_gs    <- readRDS("input_data/maize_gs")
+soybeans_gs <- readRDS("input_data/soybeans_gs")
+
+maize_gs <- maize_gs %>%
+  mutate(county_factor = factor(fips))
+
+soybeans_gs <- soybeans_gs %>%
+  mutate(county_factor = factor(fips))
+
+model_soy_irrig   <- readRDS("input_data/model_soy_irrig.rds")
+model_soy_rain    <- readRDS("input_data/model_soy_rain.rds")
+model_maize_irrig <- readRDS("input_data/model_maize_irrig.rds")
+model_maize_rain  <- readRDS("input_data/model_maize_rain.rds")
+
+maize_counties   <- as.character(unique(maize_gs$fips))
+soybean_counties <- as.character(unique(soybeans_gs$fips))
+```
+
+> **Note:** To refit models from scratch, see `prism_data_organizing.Rmd`.
+> The code block below is provided for reference and is not evaluated by default.
+
+```{r fit-models, eval=FALSE}
+formula_irrig <- irr ~ KDD_sum_yearly + GDD_sum_yearly +
+                       prism_ppt + I(prism_ppt^2) +
+                       county_factor + factor(year)
+
+formula_rain  <- rainfed ~ KDD_sum_yearly + GDD_sum_yearly +
+                           prism_ppt + I(prism_ppt^2) +
+                           county_factor + factor(year)
+
+model_soy_irrig   <- lm(formula_irrig, data = soybeans_gs)
+model_soy_rain    <- lm(formula_rain,  data = soybeans_gs)
+model_maize_irrig <- lm(formula_irrig, data = maize_gs)
+model_maize_rain  <- lm(formula_rain,  data = maize_gs)
+
+saveRDS(model_soy_irrig,   "input_data/model_soy_irrig.rds")
+saveRDS(model_soy_rain,    "input_data/model_soy_rain.rds")
+saveRDS(model_maize_irrig, "input_data/model_maize_irrig.rds")
+saveRDS(model_maize_rain,  "input_data/model_maize_rain.rds")
+```
+
+---
+
+## 2. Load and Crop CMIP6 Data
+
+Each GCM parquet file is filtered to the counties present in the historical
+yield analysis. Only variables required for degree-day calculations are
+retained.
+
+```{r crop-cmip-function}
+crop_cmip_to_training <- function(parquet_path, counties) {
+  vars_needed <- c("GEOID", "time", "tasmax", "tasmin",
+                   "pr", "daily_mean_vpd_tdew_bc_temp")
+  open_dataset(parquet_path) |>
+    select(any_of(vars_needed)) |>
+    filter(GEOID %in% counties) |>
+    collect()
+}
+```
+
+```{r load-cmip, cache=TRUE}
+cmip_files <- list(
+  GFDL  = "input_data/all_GFDL-ESM4_ssp245_bc.parquet",
+  IPSL  = "input_data/all_IPSL-CM6A-LR_ssp245_bc.parquet",
+  MPI   = "input_data/all_MPI-ESM1-2-HR_ssp245_bc.parquet",
+  MRI   = "input_data/all_MRI-ESM2-0_ssp245_bc.parquet",
+  UKESM = "input_data/all_UKESM1-0-LL_ssp245_bc.parquet"
+)
+
+cmip_cropped <- list()
+
+for (m in names(cmip_files)) {
+  message("Loading GCM: ", m)
+  cmip_cropped[[m]] <- list(
+    maize = crop_cmip_to_training(cmip_files[[m]], maize_counties),
+    soy   = crop_cmip_to_training(cmip_files[[m]], soybean_counties)
+  )
+  # Ensure 5-digit GEOID formatting
+  cmip_cropped[[m]]$maize <- cmip_cropped[[m]]$maize %>%
+    mutate(GEOID = sprintf("%05s", GEOID))
+  cmip_cropped[[m]]$soy <- cmip_cropped[[m]]$soy %>%
+    mutate(GEOID = sprintf("%05s", GEOID))
+}
+```
+
+---
+
+## 3. Compute Daily GDD and KDD
+
+Growing Degree Days (GDD) and Killing Degree Days (KDD) use the same hourly
+temperature profile as the historical analysis (Parton & Logan 1981).
+Vectorised matrix arithmetic is used for efficiency.
+
+```{r degree-day-functions}
+kdd_threshold <- 30
+gdd_base      <- 10
+gdd_cap       <- 30
+
+Tf <- 0.44 - 0.46 * sin((pi * seq(0.5, 23, 1)) / 12 + 0.9) +
+      0.11 * sin((2 * pi * seq(0.5, 23, 1)) / 12 + 0.9)
+
+compute_kdd_gdd <- function(df) {
+  hrlyT <- outer(df$tasmax, Tf) + outer(df$tasmin, (1 - Tf))
+
+  # KDD: hours above heat stress threshold
+  df$KDD_daily <- rowMeans(pmax(hrlyT - kdd_threshold, 0))
+
+  # GDD: hours within biological temperature range
+  hrlyT_GDD    <- pmin(pmax(hrlyT, gdd_base), gdd_cap)
+  df$GDD_daily <- rowMeans(pmax(hrlyT_GDD - gdd_base, 0))
+
+  df
+}
+```
+
+---
+
+## 4. Aggregate to County-Year Summaries
+
+```{r aggregate-function}
+aggregate_county_year <- function(df) {
+  df %>%
+    mutate(year = year(time)) %>%
+    group_by(GEOID, year) %>%
+    summarise(
+      GDD_sum_yearly = sum(GDD_daily, na.rm = TRUE),
+      KDD_sum_yearly = sum(KDD_daily, na.rm = TRUE),
+      prism_ppt      = sum(pr,        na.rm = TRUE),
+      vpd_mean       = mean(daily_mean_vpd_tdew_bc_temp, na.rm = TRUE),
+      .groups        = "drop"
+    )
+}
+```
+
+---
+
+## 5. Prepare Data for Prediction
+
+County factor levels are aligned to the training data. The technology trend
+is held constant at 2018 (the final historical year) to isolate the climate
+signal.
+
+```{r prediction-functions}
+frozen_year <- 2018
+
+prepare_for_prediction <- function(df, model_object) {
+  df <- df %>%
+    mutate(GEOID = sprintf("%05s", GEOID)) %>%
+    filter(GEOID %in% levels(model_object$model$county_factor)) %>%
+    mutate(county_factor = factor(GEOID,
+                                  levels = levels(model_object$model$county_factor)))
+
+  required_cols <- c("year", "GDD_sum_yearly", "KDD_sum_yearly",
+                     "prism_ppt", "vpd_mean", "cip_year", "county_factor")
+  missing_cols <- setdiff(required_cols, names(df))
+  if (length(missing_cols) > 0) {
+    stop("Missing columns: ", paste(missing_cols, collapse = ", "))
+  }
+
+  df$predicted_yield <- predict(model_object, newdata = df)
+  df
+}
+
+process_crop_for_model <- function(cropped_df, model_object, frozen_year) {
+  cropped_df %>%
+    compute_kdd_gdd() %>%
+    aggregate_county_year() %>%
+    mutate(
+      cip_year = year,
+      year     = frozen_year
+    ) %>%
+    prepare_for_prediction(model_object)
+}
+```
+
+---
+
+## 6. Run Projections Across All GCMs
+
+```{r run-projections, cache=TRUE}
+maize_models <- list(irrigated = model_maize_irrig, rainfed = model_maize_rain)
+soy_models   <- list(irrigated = model_soy_irrig,   rainfed = model_soy_rain)
+
+results <- list()
+
+for (gcm in names(cmip_cropped)) {
+  message("Processing GCM: ", gcm)
+  results[[gcm]] <- list(
+    maize = list(
+      irrigated = process_crop_for_model(cmip_cropped[[gcm]]$maize,
+                                         maize_models$irrigated, frozen_year),
+      rainfed   = process_crop_for_model(cmip_cropped[[gcm]]$maize,
+                                         maize_models$rainfed,   frozen_year)
+    ),
+    soy = list(
+      irrigated = process_crop_for_model(cmip_cropped[[gcm]]$soy,
+                                         soy_models$irrigated, frozen_year),
+      rainfed   = process_crop_for_model(cmip_cropped[[gcm]]$soy,
+                                         soy_models$rainfed,   frozen_year)
+    )
+  )
+}
+```
+
+---
+
+## 7. Summarize Across GCMs
+
+Mean yield per year is computed within each GCM, then the ensemble mean,
+minimum, and maximum are derived across GCMs to represent projection
+uncertainty.
+
+```{r summarize-gcms}
+summarize_yield_gcms <- function(gcm_list, model) {
+  gcm_means <- lapply(seq_along(gcm_list), function(i) {
+    df   <- gcm_list[[i]]
+    pred <- predict(model, newdata = df)
+    df %>%
+      mutate(predicted_yield = pmax(pred, 0)) %>%
+      group_by(cip_year) %>%
+      summarise(mean_yield_gcm = mean(predicted_yield, na.rm = TRUE),
+                .groups = "drop") %>%
+      mutate(GCM = names(gcm_list)[i])
+  })
+
+  bind_rows(gcm_means) %>%
+    group_by(cip_year) %>%
+    summarise(
+      mean_yield = mean(mean_yield_gcm, na.rm = TRUE),
+      min_yield  = min(mean_yield_gcm,  na.rm = TRUE),
+      max_yield  = max(mean_yield_gcm,  na.rm = TRUE),
+      .groups    = "drop"
+    ) %>%
+    filter(cip_year != 2014) %>%
+    rename(year = cip_year)
+}
+
+corn_df <- bind_rows(
+  summarize_yield_gcms(lapply(results, \(x) x$maize$irrigated), model_maize_irrig) %>% mutate(Type = "Irrigated"),
+  summarize_yield_gcms(lapply(results, \(x) x$maize$rainfed),   model_maize_rain)  %>% mutate(Type = "Rainfed")
+)
+
+soy_df <- bind_rows(
+  summarize_yield_gcms(lapply(results, \(x) x$soy$irrigated), model_soy_irrig) %>% mutate(Type = "Irrigated"),
+  summarize_yield_gcms(lapply(results, \(x) x$soy$rainfed),   model_soy_rain)  %>% mutate(Type = "Rainfed")
+)
+```
+
+---
+
+## 8. Plot Projected Yields
+
+Shaded ribbons represent the GCM ensemble range (min–max). Lines show the
+ensemble mean.
+
+```{r plot-function}
+cols <- c("Irrigated" = "#1f78b4", "Rainfed" = "#33a02c")
+
+make_plot_minmax <- function(df, crop_name, file_name) {
+  p <- ggplot(df, aes(x = year, y = mean_yield, color = Type, fill = Type)) +
+    geom_ribbon(aes(ymin = min_yield, ymax = max_yield, group = Type),
+                alpha = 0.2, color = NA) +
+    geom_line(aes(group = Type), linewidth = 1.2) +
+    scale_color_manual(values = cols,
+                       labels = c("Irrigated" = "IRRIGATED", "Rainfed" = "RAINFED")) +
+    scale_fill_manual(values  = cols,
+                      labels  = c("Irrigated" = "IRRIGATED", "Rainfed" = "RAINFED")) +
+    scale_x_continuous(expand = c(0, 0),
+                       breaks = c(min(df$year), 2050, 2100)) +
+    scale_y_continuous(expand = c(0, 0)) +
+    labs(x = "Year", y = "Predicted Yield (bu/ac)", title = crop_name) +
+    theme_classic(base_size = 16) +
+    theme(
+      legend.position = "bottom",
+      legend.title    = element_blank(),
+      legend.text     = element_text(size = 14),
+      axis.title      = element_text(face = "bold", size = 16),
+      axis.text       = element_text(size = 14),
+      plot.title      = element_text(face = "bold", size = 18, hjust = 0.5),
+      axis.line       = element_line(linewidth = 0.8),
+      panel.border    = element_rect(color = "black", fill = NA, linewidth = 0.8)
+    )
+
+  ggsave(file_name, p, width = 8, height = 4.5, dpi = 300)
+  p
+}
+```
+
+```{r save-plots, fig.width=8, fig.height=4.5}
+make_plot_minmax(corn_df, "Corn", "output_data/corn_plot_minmax.png")
+make_plot_minmax(soy_df,  "Soy",  "output_data/soy_plot_minmax.png")
+```
+
+---
+
+## 9. Compute Start-to-End Yield Changes
+
+Absolute and percentage yield change from the first to the last projected year,
+summarized by crop and irrigation type.
+
+```{r yield-changes}
+compute_yield_change <- function(df, crop, type_label) {
+  df %>%
+    filter(Type == type_label) %>%
+    arrange(year) %>%
+    summarise(
+      Crop        = crop,
+      Type        = type_label,
+      Start_Year  = first(year),
+      End_Year    = last(year),
+      Start_Yield = round(first(mean_yield), 2),
+      End_Yield   = round(last(mean_yield),  2),
+      Abs_Change  = round(last(mean_yield) - first(mean_yield), 2),
+      Pct_Change  = round(((last(mean_yield) - first(mean_yield)) / first(mean_yield)) * 100, 1)
+    )
+}
+
+yield_changes <- bind_rows(
+  compute_yield_change(corn_df, "Corn", "Irrigated"),
+  compute_yield_change(corn_df, "Corn", "Rainfed"),
+  compute_yield_change(soy_df,  "Soy",  "Irrigated"),
+  compute_yield_change(soy_df,  "Soy",  "Rainfed")
+)
+
+knitr::kable(yield_changes,
+             caption = "Projected yield change from start to end of simulation period.")
+```

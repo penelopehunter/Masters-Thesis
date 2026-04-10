@@ -1,0 +1,516 @@
+---
+title: "PRISM Climate Data Processing & Crop Yield Regression Analysis"
+author: "Penny Hunter"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+source("~/Desktop/ASCI-GitHub/Masters-Thesis/setup.R")
+```
+
+---
+
+## Overview
+
+This script processes daily PRISM climate data and USDA crop yield records to
+construct county-level growing-season datasets for maize and soybeans across
+the US Corn Belt. The pipeline covers:
+
+1. Loading and merging PRISM climate variables
+2. Extracting crop-specific growing seasons from USDA Crop Progress data
+3. Calculating daily Growing Degree Days (GDD) and Killing Degree Days (KDD)
+4. Aggregating to annual county-level summaries
+5. Merging with USDA yield data and applying data quality filters
+6. Running panel regressions and state-year block bootstrap inference
+
+---
+
+## 1. Load PRISM Climate Data
+
+```{r load-prism}
+ppt_county_full    <- readRDS("input_data/prism_data_full/ppt_county_full.rds")
+tmin_county_full   <- readRDS("input_data/prism_data_full/tmin_county_full.rds")
+tmax_county_full   <- readRDS("input_data/prism_data_full/tmax_county_full.rds")
+vpdmin_county_full <- readRDS("input_data/prism_data_full/vpdmin_county_full.rds")
+vpdmean_county_full<- readRDS("input_data/prism_data_full/vpdmean_county_full.rds")
+vpdmax_county_full <- readRDS("input_data/prism_data_full/vpdmax_county_full.rds")
+```
+
+---
+
+## 2. Prepare PRISM Datasets for Merging
+
+Drop redundant identifier columns before joining across variables.
+
+```{r prep-prism}
+prism_datasets <- list(
+  tmin_county_full,
+  ppt_county_full,
+  vpdmax_county_full,
+  vpdmin_county_full,
+  vpdmean_county_full
+)
+
+dataset_names <- c(
+  "tmin_county_full",
+  "ppt_county_full",
+  "vpdmax_county_full",
+  "vpdmin_county_full",
+  "vpdmean_county_full"
+)
+
+cols_to_remove <- c("county_name", "county_count", "Year", "Month", "Day")
+
+for (i in seq_along(prism_datasets)) {
+  df <- prism_datasets[[i]]
+  df <- df[, !(names(df) %in% cols_to_remove)]
+  assign(dataset_names[i], df, envir = .GlobalEnv)
+}
+```
+
+---
+
+## 3. Merge All PRISM Variables
+
+Join all climate variables into a single panel dataset keyed by county (GEOID)
+and date (time).
+
+```{r merge-prism}
+merged_prism_full <- tmax_county_full %>%
+  full_join(tmin_county_full,    by = c("time", "GEOID")) %>%
+  full_join(ppt_county_full,     by = c("time", "GEOID")) %>%
+  full_join(vpdmax_county_full,  by = c("time", "GEOID")) %>%
+  full_join(vpdmean_county_full, by = c("time", "GEOID")) %>%
+  full_join(vpdmin_county_full,  by = c("time", "GEOID"))
+
+merged_prism_full_1 <- merged_prism_full
+
+saveRDS(
+  merged_prism_full_1,
+  "/Users/pennyhunter/Desktop/ASCI-GitHub/Masters-Thesis/input_data/merged_prism_full_1.RDS"
+)
+
+rm(merged_prism_full, ppt_county_full, tmin_county_full, tmax_county_full,
+   vpdmin_county_full, vpdmean_county_full, vpdmax_county_full,
+   prism_datasets, df)
+```
+
+---
+
+## 4. Load Growing Season Dates from USDA Crop Progress
+
+Median emergence and harvest day-of-year by state, derived from USDA Crop
+Progress reports.
+
+```{r load-growing-seasons}
+maize_median    <- read_csv("input_data/maize_median.csv")
+soybeans_median <- read_csv("input_data/soybeans_median.csv")
+
+condense_seasons <- function(df) {
+  df %>%
+    select(state_name, state_id, growing_phase, start_doy) %>%
+    filter(growing_phase %in% c("EMERGED", "HARVESTED")) %>%
+    pivot_wider(names_from = growing_phase, values_from = start_doy) %>%
+    rename(emerged = EMERGED, harvested = HARVESTED)
+}
+
+maize_condensed    <- condense_seasons(maize_median)
+soybeans_condensed <- condense_seasons(soybeans_median)
+
+rm(maize_median, soybeans_median)
+```
+
+---
+
+## 5. Subset PRISM Data to Crop Growing Seasons
+
+Retain only observations falling within each crop's state-specific growing
+season window.
+
+```{r subset-growing-season}
+merged_prism_full_1 <- merged_prism_full_1 %>%
+  mutate(
+    time     = as.Date(time),
+    doy      = yday(time),
+    state_id = as.integer(str_sub(GEOID, 1, 2))
+  )
+
+maize_gs <- merged_prism_full_1 %>%
+  left_join(maize_condensed, by = "state_id") %>%
+  filter(doy >= emerged & doy <= harvested) %>%
+  select(-emerged, -harvested)
+
+soybeans_gs <- merged_prism_full_1 %>%
+  left_join(soybeans_condensed, by = "state_id") %>%
+  filter(doy >= emerged & doy <= harvested) %>%
+  select(-emerged, -harvested)
+
+rm(merged_prism_full_1, maize_condensed, soybeans_condensed)
+```
+
+---
+
+## 6. Construct Daily GDD and KDD
+
+Growing Degree Days (GDD) and Killing Degree Days (KDD) are calculated using
+an hourly temperature profile derived from daily Tmax and Tmin following
+Schlenker & Roberts (2009).
+
+```{r gdd-kdd-functions}
+kdd_threshold <- 30  # Heat stress threshold (°C)
+gdd_base      <- 10  # Biological base temperature (°C)
+gdd_cap       <- 30  # Biological ceiling temperature (°C)
+
+# Hourly temperature fraction profile (Parton & Logan 1981)
+Tf <- 0.44 - 0.46 * sin((pi * seq(0.5, 23, 1)) / 12 + 0.9) +
+      0.11 * sin((2 * pi * seq(0.5, 23, 1)) / 12 + 0.9)
+
+calculate_kdd <- function(T_max, T_min, thr, Tf) {
+  hrlyT <- T_max * Tf + T_min * (1 - Tf)
+  sum(pmax(hrlyT - thr, 0)) / 24
+}
+
+calculate_gdd <- function(T_max, T_min, Tf, base = 10, cap = 30) {
+  T_max <- min(T_max, cap)
+  T_min <- max(T_min, base)
+  hrlyT <- T_max * Tf + T_min * (1 - Tf)
+  sum(pmax(hrlyT - base, 0)) / 24
+}
+```
+
+```{r apply-gdd-kdd}
+apply_degree_days <- function(df) {
+  df$KDD <- mapply(calculate_kdd,
+                   T_max = df$prism_tmax, T_min = df$prism_tmin,
+                   MoreArgs = list(thr = kdd_threshold, Tf = Tf))
+  df$GDD <- mapply(calculate_gdd,
+                   T_max = df$prism_tmax, T_min = df$prism_tmin,
+                   MoreArgs = list(Tf = Tf, base = gdd_base, cap = gdd_cap))
+  df
+}
+
+maize_gs    <- apply_degree_days(maize_gs)
+soybeans_gs <- apply_degree_days(soybeans_gs)
+```
+
+---
+
+## 7. Aggregate to Annual County-Level Summaries
+
+Sum KDD and GDD over the growing season; average remaining climate variables
+by county-year.
+
+```{r annual-aggregation}
+aggregate_annual <- function(df) {
+  df %>%
+    mutate(year = year(time)) %>%
+    group_by(GEOID, year) %>%
+    mutate(
+      KDD_sum_yearly = sum(KDD, na.rm = TRUE),
+      GDD_sum_yearly = sum(GDD, na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    select(-KDD, -GDD) %>%
+    group_by(GEOID, year) %>%
+    summarise(
+      county_count   = first(county_count),
+      prism_tmax     = mean(prism_tmax,    na.rm = TRUE),
+      prism_tmin     = mean(prism_tmin,    na.rm = TRUE),
+      prism_vpdmean  = mean(prism_vpdmean, na.rm = TRUE),
+      prism_vpdmax   = mean(prism_vpdmax,  na.rm = TRUE),
+      prism_vpdmin   = mean(prism_vpdmin,  na.rm = TRUE),
+      prism_ppt      = sum(prism_ppt,      na.rm = TRUE),
+      KDD_sum_yearly = first(KDD_sum_yearly),
+      GDD_sum_yearly = first(GDD_sum_yearly),
+      .groups = "drop"
+    )
+}
+
+maize_gs    <- aggregate_annual(maize_gs)
+soybeans_gs <- aggregate_annual(soybeans_gs)
+```
+
+---
+
+## 8. Merge with USDA Yield Data
+
+```{r merge-yield}
+yield_benefit_model_data <- read_csv("input_data/yield-benefit-model-data.csv")
+
+crop_datasets <- split(yield_benefit_model_data, yield_benefit_model_data$commodity_desc)
+list2env(crop_datasets, envir = .GlobalEnv)
+
+CORN <- CORN %>% filter(util_practice_desc == "GRAIN")
+
+rm(OATS, PEANUTS, SORGHUM, WHEAT, HAY, COTTON, BEANS, BARLEY,
+   yield_benefit_model_data, crop_datasets)
+
+maize_gs <- merge(CORN,     maize_gs,    by.x = c("fips", "year"), by.y = c("GEOID", "year"), all.x = TRUE)
+soybeans_gs <- merge(SOYBEANS, soybeans_gs, by.x = c("fips", "year"), by.y = c("GEOID", "year"), all.x = TRUE)
+
+rm(CORN, SOYBEANS)
+```
+
+---
+
+## 9. Apply Data Quality Filters
+
+Retain only counties with at least 10 years of yield observations.
+
+```{r quality-filter}
+maize_gs <- maize_gs %>%
+  group_by(fips) %>%
+  filter(n_distinct(year) >= 10) %>%
+  ungroup()
+
+soybeans_gs <- soybeans_gs %>%
+  group_by(fips) %>%
+  filter(n_distinct(year) >= 10) %>%
+  ungroup()
+```
+
+---
+
+## 10. Finalize and Save Processed Datasets
+
+```{r save-datasets}
+# Save county crosswalk for downstream spatial work
+counties_combined <- bind_rows(
+  maize_gs    %>% select(fips, county_ansi, state_ansi),
+  soybeans_gs %>% select(fips, county_ansi, state_ansi)
+) %>% distinct()
+
+saveRDS(counties_combined, file = "input_data/counties_combined.rds")
+
+# Create factor variables for panel regression
+maize_gs <- maize_gs %>%
+  mutate(
+    county_factor = as.factor(county_ansi),
+    state_factor  = as.factor(state_ansi)
+  )
+
+soybeans_gs <- soybeans_gs %>%
+  mutate(
+    county_factor = as.factor(county_ansi),
+    state_factor  = as.factor(state_ansi)
+  )
+
+# Convert precipitation to cm (from mm)
+maize_gs    <- maize_gs    %>% mutate(prism_ppt_cm = prism_ppt / 10)
+soybeans_gs <- soybeans_gs %>% mutate(prism_ppt_cm = prism_ppt / 10)
+
+saveRDS(maize_gs,    file = "input_data/maize_gs")
+saveRDS(soybeans_gs, file = "input_data/soybeans_gs")
+
+crops <- list(corn = maize_gs, soybeans = soybeans_gs)
+```
+
+---
+## 11. State-Year Block Bootstrap: KDD Sensitivity
+
+Bootstrap confidence intervals for the KDD coefficient using state-year block
+resampling to account for spatial and temporal dependence.
+
+```{r bootstrap-function}
+set.seed(123)
+n_boot <- 1000
+
+bootstrap_lm_state_year <- function(data, formula, n_boot = 1000,
+                                    state_var = "state_ansi", year_var = "year") {
+  base_model <- lm(formula, data = data)
+  coef_names <- names(coef(base_model))
+
+  data <- data %>%
+    mutate(state_year = interaction(.data[[state_var]], .data[[year_var]], drop = TRUE))
+  unique_blocks <- unique(data$state_year)
+
+  boot_coefs <- replicate(n_boot, {
+    sampled_blocks <- sample(unique_blocks, size = length(unique_blocks), replace = TRUE)
+    boot_sample    <- do.call(rbind, lapply(sampled_blocks, function(b) data[data$state_year == b, ]))
+
+    tryCatch({
+      coefs      <- coef(lm(formula, data = boot_sample))
+      coefs_full <- setNames(rep(NA, length(coef_names)), coef_names)
+      coefs_full[intersect(names(coefs), coef_names)] <- coefs[intersect(names(coefs), coef_names)]
+      coefs_full
+    }, error = function(e) setNames(rep(NA, length(coef_names)), coef_names))
+  }, simplify = TRUE)
+
+  as.data.frame(t(boot_coefs))
+}
+```
+
+```{r run-bootstrap}
+boot_results <- list()
+
+for (crop_name in names(crops)) {
+  crop_data <- crops[[crop_name]]
+
+  for (water_type in c("rainfed", "irr")) {
+    if (!water_type %in% names(crop_data)) next
+
+    formula <- as.formula(paste0(
+      water_type,
+      " ~ KDD_sum_yearly + GDD_sum_yearly + prism_ppt_cm + I(prism_ppt_cm^2) +",
+      " county_factor + factor(year)"
+    ))
+
+    boot_df   <- bootstrap_lm_state_year(crop_data, formula, n_boot)
+    kdd_coefs <- na.omit(boot_df$KDD_sum_yearly)
+    if (length(kdd_coefs) < 10) next
+
+    boot_results[[length(boot_results) + 1]] <- data.frame(
+      Crop  = tools::toTitleCase(crop_name),
+      Type  = toupper(ifelse(water_type == "irr", "IRRIGATED", "RAINFED")),
+      Mean  = mean(kdd_coefs),
+      Lower = quantile(kdd_coefs, 0.025),
+      Upper = quantile(kdd_coefs, 0.975)
+    )
+  }
+}
+
+boot_results_df <- bind_rows(boot_results)
+```
+
+```{r plot-bootstrap, fig.width=9, fig.height=6.5}
+nice_colors <- c("IRRIGATED" = "#1f78b4", "RAINFED" = "#33a02c")
+
+kdd_plot <- ggplot(boot_results_df, aes(x = Crop, y = Mean, color = Type)) +
+  geom_point(size = 5.4, position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper),
+                width = 0.2, linewidth = 2.7,
+                position = position_dodge(width = 0.5)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.9) +
+  scale_color_manual(values = nice_colors) +
+  labs(
+    x     = expression(bold("Crop Type")),
+    y     = expression(bold(beta[1] ~ "(KDD)")),
+    color = NULL
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    panel.grid.major  = element_blank(),
+    panel.grid.minor  = element_blank(),
+    panel.border      = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.title        = element_text(size = 20, face = "bold"),
+    axis.text         = element_text(size = 16),
+    axis.text.x       = element_text(angle = 45, hjust = 1),
+    legend.position   = "right",
+    legend.key.size   = unit(1.6, "lines"),
+    legend.text       = element_text(size = 16),
+    legend.spacing.y  = unit(0.35, "cm")
+  )
+
+kdd_plot
+
+ggsave(
+  filename = "output_data/KDD_bootstrap_coefficients.png",
+  plot     = kdd_plot,
+  width    = 9, height = 6.5, dpi = 600
+)
+```
+
+---
+
+## 12. Export Regression Tables to Word
+
+Coefficient tables with bootstrap confidence intervals exported for each
+crop-by-irrigation combination.
+
+```{r export-word-tables}
+library(officer)
+
+coef_keep <- c(
+  "KDD_sum_yearly",
+  "GDD_sum_yearly",
+  "prism_ppt_cm",
+  "I(prism_ppt_cm^2)"
+)
+
+pretty_labels <- c(
+  KDD_sum_yearly       = "Killing Degree Days",
+  GDD_sum_yearly       = "Growing Degree Days",
+  prism_ppt_cm         = "Precipitation (cm)",
+  "I(prism_ppt_cm^2)"  = "Precipitation\u00B2 (cm)"
+)
+
+get_stars <- function(ci_low, ci_high) {
+  if (ci_low > 0 | ci_high < 0) {
+    if (abs(ci_low) > 0.1 & abs(ci_high) > 0.1) "***"
+    else if (abs(ci_low) > 0.05 & abs(ci_high) > 0.05) "**"
+    else "*"
+  } else ""
+}
+
+for (crop_name in names(crops)) {
+  crop_data  <- crops[[crop_name]]
+  crop_title <- tools::toTitleCase(crop_name)
+
+  for (water_type in c("rainfed", "irr")) {
+    if (!water_type %in% names(crop_data)) next
+
+    water_title <- ifelse(water_type == "irr", "Irrigated", "Rainfed")
+
+    formula <- as.formula(paste0(
+      water_type,
+      " ~ KDD_sum_yearly + GDD_sum_yearly + prism_ppt_cm + I(prism_ppt_cm^2) +",
+      " county_factor + factor(year)"
+    ))
+
+    model   <- lm(formula, data = crop_data)
+    boot_df <- bootstrap_lm_state_year(crop_data, formula, n_boot,
+                                       state_var = "state_ansi", year_var = "year")
+
+    coef_rows <- lapply(coef_keep, function(term) {
+      if (!term %in% names(boot_df)) return(NULL)
+      x <- na.omit(boot_df[[term]])
+      if (length(x) < 10) return(NULL)
+
+      ci_low  <- quantile(x, 0.025)
+      ci_high <- quantile(x, 0.975)
+
+      data.frame(
+        Predictor = pretty_labels[term],
+        Estimate  = paste0(round(coef(model)[term], 3), get_stars(ci_low, ci_high)),
+        `95% CI`  = paste0("[", round(ci_low, 3), ", ", round(ci_high, 3), "]"),
+        stringsAsFactors = FALSE
+      )
+    })
+
+    table_df <- bind_rows(coef_rows)
+
+    stats_df <- data.frame(
+      Predictor = c("Observations", "R-squared"),
+      Estimate  = as.character(c(nobs(model), round(summary(model)$r.squared, 3))),
+      `95% CI`  = c("", ""),
+      stringsAsFactors = FALSE
+    )
+
+    table_df <- bind_rows(table_df, stats_df)
+
+    doc <- read_docx() %>%
+      body_add_par(paste0(crop_title, " \u2014 ", water_title), style = "heading 1") %>%
+      body_add_table(value = table_df) %>%
+      body_add_par(
+        paste0("Notes: County and year fixed effects included. ",
+               "95% CIs based on state-year block bootstrap (", n_boot, " replications). ",
+               "* p<0.05, ** p<0.01, *** p<0.001."),
+        style = "Normal"
+      )
+
+    print(doc, target = paste0(crop_name, "_", water_title, ".docx"))
+  }
+}
+```
