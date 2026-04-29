@@ -1,0 +1,713 @@
+---
+title: "Bootstrap Yield Projections Under Climate Change"
+author: "Penny Hunter"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(arrow)
+```
+
+# Overview
+# For each of the 4 models (corn irrigated, corn rainfed, soy irrigated, soy rainfed):
+# 1. Run 1000 bootstrap iterations using state-year block resampling on historical PRISM data
+# 2. For each bootstrap iteration x 5 GCMs = 5000 yield trajectories per crop model
+# 3. Each trajectory = one bootstrap model fit on resampled historical data,
+#    predicted through one GCM with year frozen at 2018
+# 4. 2.5% and 97.5% quantiles across 5000 trajectories = 95% CI band
+# 5. Mean across 5000 trajectories = central estimate line
+
+# ============================================================
+# 1. LOAD DATA AND MODELS
+# ============================================================
+
+```{r load-data}
+# Load historical growing season data (used for bootstrap resampling)
+maize_gs     <- readRDS("input_data/maize_gs")
+soybeans_gs  <- readRDS("input_data/soybeans_gs")
+
+# Ensure county_factor uses fips (consistent with model training)
+maize_gs <- maize_gs %>%
+  mutate(county_factor = factor(fips))
+
+soybeans_gs <- soybeans_gs %>%
+  mutate(county_factor = factor(fips))
+
+# Load trained models (used as reference for factor levels and formula)
+model_maize_irrig <- readRDS("input_data/model_maize_irrig.rds")
+model_maize_rain  <- readRDS("input_data/model_maize_rain.rds")
+model_soy_irrig   <- readRDS("input_data/model_soy_irrig.rds")
+model_soy_rain    <- readRDS("input_data/model_soy_rain.rds")
+
+# Load county lists for CMIP cropping
+maize_counties   <- as.character(unique(maize_gs$fips))
+soybean_counties <- as.character(unique(soybeans_gs$fips))
+```
+
+# ============================================================
+# 2. CMIP DATA LOADING
+# ============================================================
+
+```{r load-cmip}
+# Function to crop CMIP parquet to training counties
+crop_cmip_to_training <- function(parquet_path, counties) {
+  ds <- open_dataset(parquet_path)
+  vars_needed <- c("GEOID", "time", "tasmax", "tasmin",
+                   "pr", "daily_mean_vpd_tdew_bc_temp")
+  ds_small <- ds |>
+    select(any_of(vars_needed)) |>
+    filter(GEOID %in% counties)
+  collect(ds_small)
+}
+
+# CMIP file paths (SSP2-4.5)
+cmip_files <- list(
+  GFDL  = "input_data/all_GFDL-ESM4_ssp245_bc.parquet",
+  IPSL  = "input_data/all_IPSL-CM6A-LR_ssp245_bc.parquet",
+  MPI   = "input_data/all_MPI-ESM1-2-HR_ssp245_bc.parquet",
+  MRI   = "input_data/all_MRI-ESM2-0_ssp245_bc.parquet",
+  UKESM = "input_data/all_UKESM1-0-LL_ssp245_bc.parquet"
+)
+
+# Load and crop all GCMs
+cmip_cropped <- list()
+
+for (m in names(cmip_files)) {
+  message("Cropping CMIP data for GCM: ", m)
+  cmip_cropped[[m]] <- list(
+    maize = crop_cmip_to_training(cmip_files[[m]], maize_counties),
+    soy   = crop_cmip_to_training(cmip_files[[m]], soybean_counties)
+  )
+  # Pad GEOID to 5 digits
+  cmip_cropped[[m]]$maize <- cmip_cropped[[m]]$maize %>%
+    mutate(GEOID = sprintf("%05s", GEOID))
+  cmip_cropped[[m]]$soy <- cmip_cropped[[m]]$soy %>%
+    mutate(GEOID = sprintf("%05s", GEOID))
+}
+```
+
+# ============================================================
+# 3. KDD / GDD FUNCTIONS (unchanged from future projection script)
+# ============================================================
+
+```{r kdd-gdd-functions}
+kdd_threshold <- 30
+gdd_base      <- 10
+gdd_cap       <- 30
+
+# Hourly temperature profile
+Tf <- 0.44 - 0.46 * sin((pi * seq(0.5, 23, 1)) / 12 + 0.9) +
+      0.11 * sin((2 * pi * seq(0.5, 23, 1)) / 12 + 0.9)
+
+# Vectorised daily KDD and GDD using matrix multiplication
+compute_kdd_gdd <- function(df) {
+  hrlyT <- outer(df$tasmax, Tf) * 1 + outer(df$tasmin, (1 - Tf))
+
+  KDD_mat   <- pmax(hrlyT - kdd_threshold, 0)
+  KDD_daily <- rowMeans(KDD_mat)
+
+  hrlyT_GDD <- pmin(pmax(hrlyT, gdd_base), gdd_cap)
+  GDD_mat   <- pmax(hrlyT_GDD - gdd_base, 0)
+  GDD_daily <- rowMeans(GDD_mat)
+
+  df$GDD_daily <- GDD_daily
+  df$KDD_daily <- KDD_daily
+  df
+}
+
+# Aggregate daily CMIP data to county-year
+aggregate_county_year <- function(df) {
+  df %>%
+    mutate(year = year(time)) %>%
+    group_by(GEOID, year) %>%
+    summarise(
+      GDD_sum_yearly = sum(GDD_daily, na.rm = TRUE),
+      KDD_sum_yearly = sum(KDD_daily, na.rm = TRUE),
+      prism_ppt      = sum(pr,        na.rm = TRUE),
+      vpd_mean       = mean(daily_mean_vpd_tdew_bc_temp, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+```
+
+# ============================================================
+# 4. PRE-PROCESS ALL CMIP DATA ONCE
+# (compute KDD/GDD and aggregate before the bootstrap loop
+#  so we are not repeating expensive operations 1000x per GCM)
+# ============================================================
+
+```{r preprocess-cmip}
+frozen_year <- 2018
+
+# Process one GCM x crop combination into a prediction-ready data frame
+prepare_cmip_for_prediction <- function(cmip_df, county_levels) {
+  cmip_df %>%
+    compute_kdd_gdd() %>%
+    aggregate_county_year() %>%
+    mutate(
+      GEOID         = sprintf("%05s", GEOID),
+      cip_year      = year,       # keep actual CMIP year for plotting
+      year          = frozen_year # freeze year to remove technology trend
+    ) %>%
+    filter(GEOID %in% county_levels) %>%
+    mutate(county_factor = factor(GEOID, levels = county_levels))
+}
+
+# Extract county levels from each trained model
+maize_county_levels <- levels(model_maize_irrig$model$county_factor)
+soy_county_levels   <- levels(model_soy_irrig$model$county_factor)
+
+# Pre-process all 5 GCMs for maize and soy
+# Result: cmip_prepped[[gcm]]$maize  and  cmip_prepped[[gcm]]$soy
+cmip_prepped <- list()
+
+for (m in names(cmip_cropped)) {
+  message("Pre-processing CMIP: ", m)
+  cmip_prepped[[m]] <- list(
+    maize = prepare_cmip_for_prediction(cmip_cropped[[m]]$maize, maize_county_levels),
+    soy   = prepare_cmip_for_prediction(cmip_cropped[[m]]$soy,   soy_county_levels)
+  )
+}
+
+# Free raw CMIP data from memory
+rm(cmip_cropped)
+gc()
+```
+
+# ============================================================
+# 5. STATE-YEAR BLOCK BOOTSTRAP FUNCTION
+# (unchanged logic from historical script)
+# ============================================================
+
+```{r bootstrap-function}
+# Bootstrap a single model formula on historical data using state-year blocks.
+# Returns a fitted lm object from one resampled dataset.
+bootstrap_one_model <- function(data, formula,
+                                state_var = "state_ansi",
+                                year_var  = "year") {
+
+  data <- data %>%
+    mutate(state_year = interaction(.data[[state_var]],
+                                    .data[[year_var]], drop = TRUE))
+
+  unique_blocks  <- unique(data$state_year)
+  sampled_blocks <- sample(unique_blocks,
+                           size    = length(unique_blocks),
+                           replace = TRUE)
+
+  boot_sample <- do.call(rbind, lapply(sampled_blocks, function(b) {
+    data[data$state_year == b, ]
+  }))
+
+  tryCatch(
+    lm(formula, data = boot_sample),
+    error = function(e) NULL   # return NULL if model fails to fit
+  )
+}
+```
+
+# ============================================================
+# 6. MAIN BOOTSTRAP LOOP
+# For each crop model:
+#   - 1000 bootstrap iterations
+#   - each iteration predicts through all 5 GCMs
+#   - store mean county yield per year for each bootstrap x GCM
+#   - total trajectories per crop model = 1000 x 5 = 5000
+# ============================================================
+
+```{r bootstrap-loop}
+set.seed(123)
+n_boot <- 1000
+
+# Define the four model configurations
+model_configs <- list(
+  corn_irrig = list(
+    data      = maize_gs,
+    cmip_crop = "maize",
+    formula   = as.formula(
+      "irr ~ KDD_sum_yearly + GDD_sum_yearly + prism_ppt +
+       I(prism_ppt^2) + county_factor + factor(year)"
+    ),
+    label     = "Maize Irrigated"
+  ),
+  corn_rain = list(
+    data      = maize_gs,
+    cmip_crop = "maize",
+    formula   = as.formula(
+      "rainfed ~ KDD_sum_yearly + GDD_sum_yearly + prism_ppt +
+       I(prism_ppt^2) + county_factor + factor(year)"
+    ),
+    label     = "Maize Rainfed"
+  ),
+  soy_irrig = list(
+    data      = soybeans_gs,
+    cmip_crop = "soy",
+    formula   = as.formula(
+      "irr ~ KDD_sum_yearly + GDD_sum_yearly + prism_ppt +
+       I(prism_ppt^2) + county_factor + factor(year)"
+    ),
+    label     = "Soy Irrigated"
+  ),
+  soy_rain = list(
+    data      = soybeans_gs,
+    cmip_crop = "soy",
+    formula   = as.formula(
+      "rainfed ~ KDD_sum_yearly + GDD_sum_yearly + prism_ppt +
+       I(prism_ppt^2) + county_factor + factor(year)"
+    ),
+    label     = "Soy Rainfed"
+  )
+)
+
+# Storage: for each model config, a list of 5000 year-mean trajectories
+# Each element is a data frame with columns: cip_year, mean_yield
+all_trajectories <- list()
+
+for (config_name in names(model_configs)) {
+  cfg <- model_configs[[config_name]]
+  message("\n===== Starting bootstrap for: ", cfg$label, " =====")
+
+  trajectories <- vector("list", n_boot * length(cmip_prepped))
+  traj_index   <- 1
+
+  for (b in seq_len(n_boot)) {
+
+    if (b %% 100 == 0) message("  Bootstrap iteration: ", b, " / ", n_boot)
+
+    # Fit one bootstrap model on resampled historical data
+    boot_model <- bootstrap_one_model(cfg$data, cfg$formula)
+
+    # Skip this iteration if model failed to fit
+    if (is.null(boot_model)) next
+
+    # Predict through all 5 GCMs using this bootstrap model
+    for (gcm_name in names(cmip_prepped)) {
+
+      cmip_df <- cmip_prepped[[gcm_name]][[cfg$cmip_crop]]
+
+      # Align county_factor levels to the bootstrap model
+      # NOTE: bootstrap model may have seen different county factor levels
+      #       so we filter to counties present in both
+      valid_counties <- intersect(
+        as.character(cmip_df$GEOID),
+        names(coef(boot_model))[grepl("county_factor", names(coef(boot_model)))] %>%
+          gsub("county_factor", "", .)
+      )
+
+      # Safer approach: align factor levels to boot_model levels
+      boot_county_levels <- tryCatch(
+        levels(boot_model$model$county_factor),
+        error = function(e) NULL
+      )
+
+      if (is.null(boot_county_levels)) next
+
+      pred_df <- cmip_df %>%
+        filter(GEOID %in% boot_county_levels) %>%
+        mutate(county_factor = factor(GEOID, levels = boot_county_levels))
+
+      if (nrow(pred_df) == 0) next
+
+      # Predict yields, cap negatives at 0
+      preds <- tryCatch(
+        predict(boot_model, newdata = pred_df),
+        error = function(e) NULL
+      )
+
+      if (is.null(preds)) next
+
+      pred_df$predicted_yield <- pmax(preds, 0)
+
+      # Summarise to mean yield per year across counties
+      year_means <- pred_df %>%
+        group_by(cip_year) %>%
+        summarise(mean_yield = mean(predicted_yield, na.rm = TRUE),
+                  .groups = "drop") %>%
+        filter(cip_year != 2014) %>%   # drop spin-up year
+        mutate(boot_iter = b, gcm = gcm_name)
+
+      trajectories[[traj_index]] <- year_means
+      traj_index <- traj_index + 1
+    }
+  }
+
+  # Combine all trajectories for this config (up to 5000 rows per year)
+  all_trajectories[[config_name]] <- bind_rows(trajectories)
+  message("  Total trajectories stored: ",
+          n_distinct(
+            paste(all_trajectories[[config_name]]$boot_iter,
+                  all_trajectories[[config_name]]$gcm)
+          ))
+}
+
+# Save trajectories for re-use without re-running
+saveRDS(all_trajectories, "input_data/bootstrap_trajectories.rds")
+message("Bootstrap complete. Trajectories saved.")
+```
+
+# ============================================================
+# 7. SUMMARISE TRAJECTORIES INTO CI BANDS
+# ============================================================
+```{r summarise-trajectories}
+
+#all_trajectories <- readRDS("input_data/bootstrap_trajectories.rds")
+# CO2 fertilization setup (Hultgren et al. 2025 / Moore et al. 2017)
+co2_ssp245 <- data.frame(
+  year    = 2015:2100,
+  co2_ppm = approx(
+    x    = c(2015, 2030, 2050, 2070, 2100),
+    y    = c(400,  423,  457,  487,  538),
+    xout = 2015:2100
+  )$y
+)
+
+co2_fertilization <- function(co2_ppm, beta, A, baseline_ppm = 400) {
+  delta <- co2_ppm - baseline_ppm
+  (beta * delta / (delta + A)) / 100
+}
+
+co2_ssp245 <- co2_ssp245 %>%
+  mutate(
+    co2_mult_maize = exp(co2_fertilization(co2_ppm, beta = 10.82, A = 50)),
+    co2_mult_soy   = exp(co2_fertilization(co2_ppm, beta = 17.20, A = 100))
+  )
+
+# Summarise trajectories and apply CO2 fertilization (yields already in MT/ha)
+summarise_trajectories <- function(traj_df) {
+  traj_df %>%
+    rename(traj_yield = mean_yield) %>%
+    group_by(cip_year) %>%
+    summarise(
+      mean_yield = mean(traj_yield,            na.rm = TRUE),
+      lower_95   = quantile(traj_yield, 0.025, na.rm = TRUE),
+      upper_95   = quantile(traj_yield, 0.975, na.rm = TRUE),
+      n_traj     = n(),
+      .groups    = "drop"
+    ) %>%
+    rename(year = cip_year)
+}
+
+corn_irrig_summary <- summarise_trajectories(all_trajectories$corn_irrig) %>%
+  mutate(Type = "Irrigated") %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_maize), by = "year") %>%
+  mutate(across(c(mean_yield, lower_95, upper_95), ~ . * co2_mult_maize)) %>%
+  select(-co2_mult_maize)
+
+corn_rain_summary <- summarise_trajectories(all_trajectories$corn_rain) %>%
+  mutate(Type = "Rainfed") %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_maize), by = "year") %>%
+  mutate(across(c(mean_yield, lower_95, upper_95), ~ . * co2_mult_maize)) %>%
+  select(-co2_mult_maize)
+
+soy_irrig_summary <- summarise_trajectories(all_trajectories$soy_irrig) %>%
+  mutate(Type = "Irrigated") %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_soy), by = "year") %>%
+  mutate(across(c(mean_yield, lower_95, upper_95), ~ . * co2_mult_soy)) %>%
+  select(-co2_mult_soy)
+
+soy_rain_summary <- summarise_trajectories(all_trajectories$soy_rain) %>%
+  mutate(Type = "Rainfed") %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_soy), by = "year") %>%
+  mutate(across(c(mean_yield, lower_95, upper_95), ~ . * co2_mult_soy)) %>%
+  select(-co2_mult_soy)
+
+corn_summary <- bind_rows(corn_irrig_summary, corn_rain_summary)
+soy_summary  <- bind_rows(soy_irrig_summary,  soy_rain_summary)
+```
+
+# ============================================================
+# 8. PLOT 1: TIME SERIES WITH 95% CI BOOTSTRAP RIBBON
+# ============================================================
+
+```{r plot-ci}
+cols <- c("Irrigated" = "#1f78b4", "Rainfed" = "#33a02c")
+
+make_plot_bootstrap_ci <- function(df, crop_name, file_name) {
+
+  p <- ggplot(df, aes(x = year, y = mean_yield,
+                      color = Type, fill = Type)) +
+    geom_ribbon(aes(ymin = lower_95, ymax = upper_95, group = Type),
+                alpha = 0.2, color = NA) +
+    geom_line(aes(group = Type), size = 1.2) +
+    scale_color_manual(
+      values = cols,
+      labels = c("Irrigated" = "IRRIGATED", "Rainfed" = "RAINFED")
+    ) +
+    scale_fill_manual(
+      values = cols,
+      labels = c("Irrigated" = "IRRIGATED", "Rainfed" = "RAINFED")
+    ) +
+    scale_x_continuous(
+      expand = c(0, 0),
+      breaks = c(min(df$year), 2050, 2100)
+    ) +
+    scale_y_continuous(expand = c(0, 0)) +
+    theme_classic(base_size = 16) +
+    theme(
+      legend.position  = "bottom",
+      legend.title     = element_blank(),
+      legend.text      = element_text(size = 14),
+      axis.title       = element_text(face = "bold", size = 16),
+      axis.text        = element_text(size = 14),
+      plot.title       = element_text(face = "bold", size = 18, hjust = 0.5),
+      axis.line        = element_line(size = 0.8),
+      panel.border     = element_rect(color = "black", fill = NA, size = 0.8)
+    ) +
+    labs(
+      x     = "Year",
+      y     = "Predicted Yield (MT/ha)",
+      title = paste0(crop_name, " — Bootstrap 95% CI (n = 5,000 trajectories)")
+    )
+
+  ggsave(file_name, p, width = 8, height = 4.5, dpi = 300)
+  p
+}
+
+corn_ci_plot <- make_plot_bootstrap_ci(
+  corn_summary, "Maize", "output_data/corn_bootstrap_ci.png"
+)
+
+soy_ci_plot  <- make_plot_bootstrap_ci(
+  soy_summary,  "Soy",  "output_data/soy_bootstrap_ci.png"
+)
+
+corn_ci_plot
+soy_ci_plot
+```
+
+
+
+# ============================================================
+# 9. YIELD CHANGE TABLE (first 20 vs last 20 years of projections)
+# ============================================================
+
+```{r yield-change-table}
+compute_yield_change_bootstrap <- function(summary_df, crop, type_label) {
+  df <- summary_df %>% filter(Type == type_label) %>% arrange(year)
+
+  years      <- sort(unique(df$year))
+  first_years <- years[1:20]
+  last_years  <- tail(years, 20)
+
+  first_mean <- df %>%
+    filter(year %in% first_years) %>%
+    summarise(m = mean(mean_yield, na.rm = TRUE)) %>%
+    pull(m)
+
+  last_mean  <- df %>%
+    filter(year %in% last_years) %>%
+    summarise(m = mean(mean_yield, na.rm = TRUE)) %>%
+    pull(m)
+
+  data.frame(
+    Crop        = crop,
+    Type        = type_label,
+    First20_mean = round(first_mean, 2),
+    Last20_mean  = round(last_mean,  2),
+    Abs_change   = round(last_mean - first_mean, 2),
+    Pct_change   = round(((last_mean - first_mean) / first_mean) * 100, 2)
+  )
+}
+
+yield_change_table <- bind_rows(
+  compute_yield_change_bootstrap(corn_summary, "Maize", "Irrigated"),
+  compute_yield_change_bootstrap(corn_summary, "Maize", "Rainfed"),
+  compute_yield_change_bootstrap(soy_summary,  "Soy",  "Irrigated"),
+  compute_yield_change_bootstrap(soy_summary,  "Soy",  "Rainfed")
+)
+
+print(yield_change_table)
+```
+
+# ============================================================
+# 10. SPAGHETTI PLOT: All 5000 trajectories + central mean line
+# ============================================================
+
+```{r yield-spaghetti-plot}
+
+make_spaghetti_plot <- function(traj_df, summary_df, crop_name, file_name) {
+  
+  cols <- c("Irrigated" = "#1f78b4", "Rainfed" = "#33a02c")
+  
+  # Add Type label to raw trajectories using config name
+  # traj_df must already have a Type column — bind irrigated and rainfed first
+  
+  p <- ggplot() +
+    # All 5000 individual trajectory lines — very transparent
+    geom_line(
+      data = traj_df,
+      aes(x = cip_year, y = mean_yield, 
+          group = interaction(boot_iter, gcm, Type),
+          color = Type),
+      alpha = 0.005,
+      linewidth = 0.3
+    ) +
+    # Central mean lines on top — thicker, same colors
+    geom_line(
+      data = summary_df,
+      aes(x = year, y = mean_yield,
+          color = Type, group = Type),
+      linewidth = 1.8
+    ) +
+    scale_color_manual(
+      values = cols,
+      labels = c("Irrigated" = "IRRIGATED", "Rainfed" = "RAINFED")
+    ) +
+    scale_x_continuous(
+      expand = c(0, 0),
+      breaks = c(2015, 2050, 2100)
+    ) +
+    scale_y_continuous(expand = c(0, 0)) +
+    theme_classic(base_size = 16) +
+    theme(
+      legend.position  = "bottom",
+      legend.title     = element_blank(),
+      legend.text      = element_text(size = 14),
+      axis.title       = element_text(face = "bold", size = 16),
+      axis.text        = element_text(size = 14),
+      plot.title       = element_text(face = "bold", size = 18, hjust = 0.5),
+      axis.line        = element_line(linewidth = 0.8),
+      panel.border     = element_rect(color = "black", fill = NA, linewidth = 0.8)
+    ) +
+    labs(
+      x     = "Year",
+      y     = "Predicted Yield (MT/ha)",
+      title = paste0(crop_name, " — Bootstrap Trajectories (n = 5,000)")
+    )
+  
+  ggsave(file_name, p, width = 8, height = 4.5, dpi = 300)
+  p
+}
+
+corn_traj_combined <- bind_rows(
+  all_trajectories$corn_irrig %>% mutate(Type = "Irrigated"),
+  all_trajectories$corn_rain  %>% mutate(Type = "Rainfed")
+) %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_maize),
+            by = c("cip_year" = "year")) %>%
+  mutate(mean_yield = mean_yield * co2_mult_maize) %>%
+  select(-co2_mult_maize)
+
+soy_traj_combined <- bind_rows(
+  all_trajectories$soy_irrig %>% mutate(Type = "Irrigated"),
+  all_trajectories$soy_rain  %>% mutate(Type = "Rainfed")
+) %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_soy),
+            by = c("cip_year" = "year")) %>%
+  mutate(mean_yield = mean_yield * co2_mult_soy) %>%
+  select(-co2_mult_soy)
+
+# Plot — these may take a minute to render with 5000 lines each
+corn_spaghetti <- make_spaghetti_plot(
+  corn_traj_combined, corn_summary,
+  "Maize", "output_data/corn_spaghetti.png"
+)
+
+soy_spaghetti <- make_spaghetti_plot(
+  soy_traj_combined, soy_summary,
+  "Soy", "output_data/soy_spaghetti.png"
+)
+
+corn_spaghetti
+soy_spaghetti
+```
+```{r yield-spaghetti-plot-publication}
+library(patchwork)
+
+make_spaghetti_plot <- function(traj_df, summary_df, crop_name, panel_letter) {
+  
+  cols <- c("Irrigated" = "#1f78b4", "Rainfed" = "#33a02c")
+  
+  ggplot() +
+    geom_line(
+      data = traj_df,
+      aes(x = cip_year, y = mean_yield, 
+          group = interaction(boot_iter, gcm, Type),
+          color = Type),
+      alpha = 0.005,
+      linewidth = 0.3
+    ) +
+    geom_line(
+      data = summary_df,
+      aes(x = year, y = mean_yield,
+          color = Type, group = Type),
+      linewidth = 1.8
+    ) +
+    scale_color_manual(
+      values = cols,
+      labels = c("Irrigated" = "IRRIGATED", "Rainfed" = "RAINFED")
+    ) +
+    scale_x_continuous(
+      expand = expansion(mult = c(0, 0.02)),
+      breaks = c(2015, 2050, 2100),
+      limits = c(2015, 2100)
+    ) +
+    scale_y_continuous(expand = c(0, 0)) +
+    theme_classic(base_size = 8) +
+    theme(
+      legend.position  = "bottom",
+      legend.title     = element_blank(),
+      legend.text      = element_text(size = 8, family = "Helvetica"),
+      axis.title       = element_text(size = 8, family = "Helvetica"),
+      axis.text        = element_text(size = 7, family = "Helvetica"),
+      plot.title       = element_text(size = 8, face = "bold",
+                                      hjust = 0, family = "Helvetica"),
+      axis.line        = element_line(linewidth = 0.5),
+      panel.border     = element_rect(color = "black", fill = NA,
+                                      linewidth = 0.5),
+      plot.margin      = margin(4, 8, 4, 4, "pt")
+    ) +
+    labs(
+      x     = "Year",
+      y     = "Predicted Yield (MT/ha)",
+      title = paste0("(", panel_letter, ") ", crop_name)
+    )
+}
+
+# Prepare trajectory data frames with CO2 adjustment only (already in MT/ha)
+corn_traj_combined <- bind_rows(
+  all_trajectories$corn_irrig %>% mutate(Type = "Irrigated"),
+  all_trajectories$corn_rain  %>% mutate(Type = "Rainfed")
+) %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_maize),
+            by = c("cip_year" = "year")) %>%
+  mutate(mean_yield = mean_yield * co2_mult_maize) %>%
+  select(-co2_mult_maize)
+
+soy_traj_combined <- bind_rows(
+  all_trajectories$soy_irrig %>% mutate(Type = "Irrigated"),
+  all_trajectories$soy_rain  %>% mutate(Type = "Rainfed")
+) %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_soy),
+            by = c("cip_year" = "year")) %>%
+  mutate(mean_yield = mean_yield * co2_mult_soy) %>%
+  select(-co2_mult_soy)
+
+# Build individual panels
+p_maize <- make_spaghetti_plot(corn_traj_combined, corn_summary, "Maize", "a")
+p_soy   <- make_spaghetti_plot(soy_traj_combined,  soy_summary,  "Soy",   "b")
+
+# Apply shared legend theme to each panel individually before combining
+p_maize <- p_maize + theme(legend.position = "bottom")
+p_soy   <- p_soy   + theme(legend.position = "bottom")
+
+# Combine and save as single figure
+p_combined <- (p_maize / p_soy) +
+  plot_layout(guides = "collect")
+
+ggsave(
+  "output_data/spaghetti_combined.png",
+  p_combined,
+  width  = 7.5,
+  height = 6,
+  dpi    = 600,
+  units  = "in"
+)
+
+p_combined
+```
