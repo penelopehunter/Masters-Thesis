@@ -131,17 +131,11 @@ merged_prism_full_1 <- merged_prism_full
 rm(merged_prism_full, ppt_county_full, vpdmax_county_full, vpdmean_county_full,
    vpdmin_county_full, tmin_county_full, tmax_county_full,
    ldas_sm_0_10, ldas_sm_10_40, ldas_sm_40_100, prism_datasets, df)
-
-saveRDS(
-  merged_prism_full_1,
-  "/Users/pennyhunter/Desktop/ASCI-GitHub/Masters-Thesis/input_data/merged_prism_full_1_wldas.RDS"
-)
-# merged_prism_full_1 <- readRDS("input_data/merged_prism_full_1_wldas.RDS")
 ```
 
 ```{r filter-counties}
 # Restrict to counties present in the yield analysis
-counties_combined   <- readRDS("input_data/counties_combined.rds")
+counties_combined   <- readRDS("input_data/counties_combined.rds") %>% filter(fips != "35031") # Exclude Hidalgo County, NM (missing growing season data)
 merged_prism_full_1 <- merged_prism_full_1 %>%
   filter(GEOID %in% counties_combined$fips)
 rm(counties_combined)
@@ -186,19 +180,33 @@ doy_clim <- doy_clim %>%
   )) %>%
   ungroup()
 
-# Compute anomalies
+# Drop clim_ columns if they already exist from a previous run
+merged_prism_full_1 <- merged_prism_full_1 %>%
+  select(-starts_with("clim_"))
+
+# Now join and compute anomalies
 merged_prism_full_1 <- merged_prism_full_1 %>%
   left_join(doy_clim, by = c("GEOID", "doy")) %>%
   mutate(
+    # Absolute anomalies (temperature and VPD)
     anomaly_vpdmax    = prism_vpdmax  - clim_prism_vpdmax,
     anomaly_vpdmin    = prism_vpdmin  - clim_prism_vpdmin,
     anomaly_vpdmean   = prism_vpdmean - clim_prism_vpdmean,
-    anomaly_ppt       = prism_ppt     - clim_prism_ppt,
     anomaly_tmax      = prism_tmax    - clim_prism_tmax,
     anomaly_tmin      = prism_tmin    - clim_prism_tmin,
-    anomaly_SM_0_10   = SM_0_10       - clim_SM_0_10,
-    anomaly_SM_10_40  = SM_10_40      - clim_SM_10_40,
-    anomaly_SM_40_100 = SM_40_100     - clim_SM_40_100
+    # Percent anomalies (precipitation and soil moisture)
+    anomaly_ppt       = ifelse(clim_prism_ppt  > 0,
+                               ((prism_ppt  - clim_prism_ppt)  / clim_prism_ppt)  * 100,
+                               NA_real_),
+    anomaly_SM_0_10   = ifelse(clim_SM_0_10   > 0,
+                               ((SM_0_10   - clim_SM_0_10)   / clim_SM_0_10)   * 100,
+                               NA_real_),
+    anomaly_SM_10_40  = ifelse(clim_SM_10_40  > 0,
+                               ((SM_10_40  - clim_SM_10_40)  / clim_SM_10_40)  * 100,
+                               NA_real_),
+    anomaly_SM_40_100 = ifelse(clim_SM_40_100 > 0,
+                               ((SM_40_100 - clim_SM_40_100) / clim_SM_40_100) * 100,
+                               NA_real_)
   )
 
 rm(doy_clim)
@@ -221,6 +229,7 @@ calculate_kdd <- function(T_max, T_min, thr, Tf) {
   sum(pmax(hrlyT - thr, 0)) / 24
 }
 
+# NOTE: GDD is computed here for completeness but is not used in the bootstrap or anomaly analysis. KDD is the only thermal metric used downstream.
 calculate_gdd <- function(T_max, T_min, Tf, base = gdd_base, cap = gdd_cap) {
   if (T_min < base || T_max > cap) return(0)
   hrlyT <- T_max * Tf + T_min * (1 - Tf)
@@ -257,7 +266,7 @@ merged_prism_full_1 <- merged_prism_full_1 %>%
 
 saveRDS(
   merged_prism_full_1,
-  "/Users/pennyhunter/Desktop/ASCI-GitHub/Masters-Thesis/input_data/merged_prism_full_1_wldas.RDS"
+  "input_data/merged_prism_full_1_wldas.RDS"
 )
 # merged_prism_full_1 <- readRDS("input_data/merged_prism_full_1_wldas.RDS")
 ```
@@ -349,7 +358,7 @@ all_boot <- rbindlist(all_results)
 
 saveRDS(
   all_boot,
-  "/Users/pennyhunter/Desktop/ASCI-GitHub/Masters-Thesis/output_data/all_boot_STATE_YEAR.RDS"
+  "output_data/all_boot_STATE_YEAR.RDS"
 )
 # all_boot <- readRDS("output_data/all_boot_STATE_YEAR.RDS")
 ```
@@ -363,22 +372,21 @@ panels share a common y-axis. Panels are labelled a–f.
 
 ```{r plot-setup}
 library(patchwork)
-
 # Variable metadata: y-axis labels
 var_meta <- list(
-  anomaly_ppt       = list(label = "Precipitation Anomaly (mm)"),
-  anomaly_SM_0_10   = list(label = "Soil Moisture 0–10 cm Anomaly (m³/m³)"),
-  anomaly_SM_10_40  = list(label = "Soil Moisture 10–40 cm Anomaly (m³/m³)"),
-  anomaly_SM_40_100 = list(label = "Soil Moisture 40–100 cm Anomaly (m³/m³)"),
+  anomaly_ppt       = list(label = "Precipitation Anomaly (% of climatology)"),
+  anomaly_SM_0_10   = list(label = "Soil Moisture 0–10 cm Anomaly (% of climatology)"),
+  anomaly_SM_10_40  = list(label = "Soil Moisture 10–40 cm Anomaly (% of climatology)"),
+  anomaly_SM_40_100 = list(label = "Soil Moisture 40–100 cm Anomaly (% of climatology)"),
   anomaly_tmax      = list(label = "Max Temperature Anomaly (°C)"),
   anomaly_vpdmax    = list(label = "VPD Maximum Anomaly (hPa)")
 )
 
-# Plot order and panel letters
-plot_order   <- c(
-  "anomaly_ppt",      "anomaly_SM_0_10",
-  "anomaly_SM_10_40", "anomaly_SM_40_100",
-  "anomaly_tmax",     "anomaly_vpdmax"
+# Left column: non-SM vars | Right column: SM vars
+plot_order <- c(
+  "anomaly_ppt",       "anomaly_SM_0_10",
+  "anomaly_tmax",      "anomaly_SM_10_40",
+  "anomaly_vpdmax",    "anomaly_SM_40_100"
 )
 plot_letters <- setNames(letters[seq_along(plot_order)], plot_order)
 
@@ -388,14 +396,14 @@ all_boot_dt <- as.data.table(all_boot)
 sm_data     <- all_boot_dt[variable %in% sm_vars]
 sm_ylim     <- c(min(sm_data$lower, na.rm = TRUE), max(sm_data$upper, na.rm = TRUE))
 
-bottom_row_vars <- c("anomaly_tmax", "anomaly_vpdmax")
+# Bottom row now: anomaly_vpdmax (left) and anomaly_SM_40_100 (right)
+bottom_row_vars <- c("anomaly_vpdmax", "anomaly_SM_40_100")
 ```
 
 ```{r plot-function}
 make_plot <- function(var, letter, ylim_fixed = NULL, show_x_axis = FALSE) {
   dat    <- all_boot_dt[variable == var]
   ylabel <- var_meta[[var]]$label
-
   p <- ggplot(dat, aes(x = day)) +
     geom_vline(xintercept = 0, linetype = "dotted",
                color = "gray50", linewidth = 0.6) +
@@ -406,28 +414,29 @@ make_plot <- function(var, letter, ylim_fixed = NULL, show_x_axis = FALSE) {
                color = "gray50", linewidth = 0.5) +
     labs(
       title = letter,
-      x     = if (show_x_axis) expression(bold("Days from Hot Day")) else NULL,
+      x     = if (show_x_axis) "Days from Hot Day" else NULL,
       y     = ylabel
     ) +
     theme(
       panel.grid        = element_blank(),
       panel.border      = element_rect(color = "black", fill = NA, linewidth = 0.5),
-      plot.title        = element_text(size = 11, face = "bold", hjust = 0),
-      axis.title.y      = element_text(size = 10, face = "bold"),
-      axis.text         = element_text(size = 9),
+      plot.title        = element_text(size = 9, face = "plain", hjust = 0,
+                                       family = "sans"),
+      axis.title.y      = element_text(size = 8, family = "sans"),
+      axis.text         = element_text(size = 7, family = "sans"),
       axis.title.x      = if (!show_x_axis) element_blank()
-                          else element_text(size = 11, face = "bold"),
+                          else element_text(size = 8, family = "sans"),
       axis.ticks        = element_line(color = "black", linewidth = 0.4),
-      axis.ticks.length = unit(3, "pt")
+      axis.ticks.length = unit(3, "pt"),
+      plot.margin       = margin(4, 6, 4, 6, "pt")
     ) +
     scale_x_continuous(expand = c(0, 0))
-
   if (!is.null(ylim_fixed)) p <- p + scale_y_continuous(limits = ylim_fixed)
   return(p)
 }
 ```
 
-```{r save-individual-plots}
+```{r save-individual-plots, eval=FALSE}
 for (var in plot_order) {
   p <- make_plot(
     var,
@@ -441,7 +450,7 @@ for (var in plot_order) {
 }
 ```
 
-```{r combined-panel, fig.width=7.5, fig.height=10}
+```{r combined-panel, fig.width=7.5, fig.height=10, eval=FALSE}
 plot_list <- lapply(plot_order, function(var) {
   make_plot(
     var,
