@@ -1,0 +1,288 @@
+---
+title: "Supplemental Figures: Climate Variables, Crop Distribution, and Historical Yields"
+author: "Penny Hunter"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(tigris)
+library(viridis)
+library(patchwork)
+
+options(tigris_use_cache = TRUE)
+```
+
+---
+
+## Overview
+
+This script builds Figure S1: county-level maps of mean growing-season
+climate variables (GDD, KDD, precipitation, Tmax, VPDmax) and crop presence
+across study counties (1981-2018), restricted to counties meeting the
+minimum 10-year data requirement.
+
+Panels a, b, d, and e (GDD, KDD, Tmax, VPDmax) use a yellow-to-purple
+(magma) scale, where purple indicates higher values. Panel c (precipitation)
+uses the standard viridis yellow-to-blue scale, where blue indicates wetter
+conditions. Panel f shows crop presence by county.
+
+---
+
+## 1. Load Data
+
+```{r load-data}
+maize_gs    <- readRDS("input_data/maize_gs")
+soybeans_gs <- readRDS("input_data/soybeans_gs")
+
+counties_combined <- readRDS("input_data/counties_combined.rds")
+# Remove Hidalgo County, NM (35031) - lacks USDA growing season data
+counties_combined <- counties_combined %>%
+  filter(fips != "35031")
+
+counties_sf <- counties(cb = TRUE, class = "sf") %>%
+  filter(!STATEFP %in% c("02", "15", "72", "78", "60", "66", "69"))
+
+states_sf <- states(cb = TRUE, class = "sf") %>%
+  filter(!STATEFP %in% c("02", "15", "72", "78", "60", "66", "69"))
+```
+
+---
+
+## 2. Compute County-Level Climate Means
+
+Mean growing-season GDD, KDD, precipitation, Tmax, and VPDmax are computed
+per county, pooling across both crops and all years.
+
+```{r compute-climate-means}
+combine_climate <- function(df) {
+  df %>%
+    filter(fips %in% counties_combined$fips) %>%
+    select(fips, KDD_sum_yearly, GDD_sum_yearly,
+           prism_ppt, prism_tmax, prism_vpdmax)
+}
+
+climate_combined <- bind_rows(
+  combine_climate(maize_gs),
+  combine_climate(soybeans_gs)
+) %>%
+  distinct()
+
+climate_summary <- climate_combined %>%
+  group_by(fips) %>%
+  summarise(
+    mean_GDD    = mean(GDD_sum_yearly, na.rm = TRUE),
+    mean_KDD    = mean(KDD_sum_yearly, na.rm = TRUE),
+    mean_ppt    = mean(prism_ppt,      na.rm = TRUE),
+    mean_tmax   = mean(prism_tmax,     na.rm = TRUE),
+    mean_vpdmax = mean(prism_vpdmax,   na.rm = TRUE),
+    .groups = "drop"
+  )
+
+map_data_climate <- counties_sf %>%
+  mutate(fips = GEOID) %>%
+  left_join(climate_summary, by = "fips")
+```
+
+---
+
+## 3. Compute Crop Presence by County
+
+```{r compute-crop-presence}
+maize_counties <- maize_gs %>%
+  filter(fips %in% counties_combined$fips) %>%
+  pull(fips) %>%
+  unique()
+
+soy_counties <- soybeans_gs %>%
+  filter(fips %in% counties_combined$fips) %>%
+  pull(fips) %>%
+  unique()
+
+presence_df <- counties_combined %>%
+  distinct(fips) %>%
+  mutate(
+    has_maize = fips %in% maize_counties,
+    has_soy   = fips %in% soy_counties,
+    Presence  = case_when(
+      has_maize & has_soy   ~ "Both",
+      has_maize & !has_soy  ~ "Maize only",
+      !has_maize & has_soy  ~ "Soybean only",
+      TRUE                  ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Presence))
+
+map_data_presence <- counties_sf %>%
+  mutate(fips = GEOID) %>%
+  left_join(presence_df, by = "fips")
+```
+
+---
+
+## 4. Plotting Function for Climate Panels
+
+```{r plot-function}
+plot_climate_panel <- function(data, states_sf, fill_var, panel_letter,
+                                title, legend_name, palette = "magma",
+                                direction = -1) {
+  ggplot() +
+    geom_sf(
+      data = data,
+      aes(fill = .data[[fill_var]]),
+      color = NA
+    ) +
+    geom_sf(
+      data = states_sf,
+      fill = NA,
+      color = "white",
+      linewidth = 0.2
+    ) +
+    {
+      if (palette == "magma") {
+        scale_fill_viridis_c(
+          option    = "magma",
+          direction = direction,
+          na.value  = "gray85",
+          name      = legend_name
+        )
+      } else {
+        scale_fill_viridis_c(
+          option    = "viridis",
+          direction = direction,
+          na.value  = "gray85",
+          name      = legend_name
+        )
+      }
+    } +
+    labs(title = paste0(panel_letter, ". ", title)) +
+    coord_sf(datum = NA) +
+    theme_minimal(base_size = 8, base_family = "Helvetica") +
+    theme(
+      axis.text       = element_blank(),
+      axis.ticks      = element_blank(),
+      panel.grid      = element_blank(),
+      plot.title      = element_text(face = "bold", size = 9, hjust = 0),
+      legend.title    = element_text(size = 7),
+      legend.text     = element_text(size = 6),
+      legend.position = "bottom",
+      legend.key.height = unit(0.3, "cm"),
+      legend.key.width  = unit(0.6, "cm")
+    )
+}
+```
+
+---
+
+## 5. Build Panels a-e (Climate Variables)
+
+GDD, KDD, Tmax, and VPDmax use the magma palette (yellow to purple, purple =
+higher). Precipitation uses the standard viridis palette (yellow to blue,
+blue = wetter).
+
+```{r build-climate-panels}
+p_gdd <- plot_climate_panel(
+  map_data_climate, states_sf, "mean_GDD", "a",
+  "Mean Growing Degree Days", "\u00b0C\u00b7day",
+  palette = "magma", direction = -1
+)
+
+p_kdd <- plot_climate_panel(
+  map_data_climate, states_sf, "mean_KDD", "b",
+  "Mean Killing Degree Days", "\u00b0C\u00b7day",
+  palette = "magma", direction = -1
+)
+
+p_ppt <- plot_climate_panel(
+  map_data_climate, states_sf, "mean_ppt", "c",
+  "Mean Precipitation", "mm",
+  palette = "viridis", direction = -1
+)
+
+p_tmax <- plot_climate_panel(
+  map_data_climate, states_sf, "mean_tmax", "d",
+  "Mean Tmax", "\u00b0C",
+  palette = "magma", direction = -1
+)
+
+p_vpd <- plot_climate_panel(
+  map_data_climate, states_sf, "mean_vpdmax", "e",
+  "Mean VPD Max", "kPa",
+  palette = "magma", direction = -1
+)
+```
+
+---
+
+## 6. Build Panel f (Crop Presence)
+
+```{r build-presence-panel}
+p_presence <- ggplot() +
+  geom_sf(
+    data = map_data_presence,
+    aes(fill = Presence),
+    color = NA
+  ) +
+  geom_sf(
+    data = states_sf,
+    fill = NA,
+    color = "white",
+    linewidth = 0.2
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Both"         = "#1f78b4",
+      "Maize only"   = "#f0c419",
+      "Soybean only" = "#33a02c"
+    ),
+    na.value = "gray85",
+    name     = NULL
+  ) +
+  labs(title = "f. Dataset Representation by Crop and County") +
+  coord_sf(datum = NA) +
+  theme_minimal(base_size = 8, base_family = "Helvetica") +
+  theme(
+    axis.text       = element_blank(),
+    axis.ticks      = element_blank(),
+    panel.grid      = element_blank(),
+    plot.title      = element_text(face = "bold", size = 9, hjust = 0),
+    legend.text     = element_text(size = 7),
+    legend.position = "bottom"
+  )
+```
+
+---
+
+## 7. Combine Panels into Figure S1
+
+```{r combine-figure-s1, fig.width=7.5, fig.height=9}
+figure_s1 <- (p_gdd | p_kdd) /
+  (p_ppt  | p_tmax) /
+  (p_vpd  | p_presence)
+
+figure_s1
+
+ggsave(
+  filename = "output_data/Figure_S1.png",
+  plot     = figure_s1,
+  width    = 7.5,
+  height   = 9,
+  dpi      = 600,
+  units    = "in",
+  bg       = "white"
+)
+```
