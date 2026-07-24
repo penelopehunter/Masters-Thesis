@@ -2,7 +2,6 @@
 
 **Authors:** Penelope L. Hunter, Dongyang Wei, Avery W. Driscoll, John T. Abatzoglou, Danica Lombardozzi, Phuong D. Dao, and Nathaniel D. Mueller
 
-**Journal:** Earth's Future
 
 ---
 
