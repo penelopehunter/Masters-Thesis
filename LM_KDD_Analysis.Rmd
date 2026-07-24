@@ -97,10 +97,7 @@ merged_prism_full <- tmax_county_full %>%
 
 merged_prism_full_1 <- merged_prism_full
 
-saveRDS(
-  merged_prism_full_1,
-  "/Users/pennyhunter/Desktop/ASCI-GitHub/Masters-Thesis/input_data/merged_prism_full_1.RDS"
-)
+saveRDS(merged_prism_full_1, "input_data/merged_prism_full_1.RDS")
 
 rm(merged_prism_full, ppt_county_full, tmin_county_full, tmax_county_full,
    vpdmin_county_full, vpdmean_county_full, vpdmax_county_full,
@@ -173,7 +170,7 @@ kdd_threshold <- 30  # Heat stress threshold (°C)
 gdd_base      <- 10  # Biological base temperature (°C)
 gdd_cap       <- 30  # Biological ceiling temperature (°C)
 
-# Hourly temperature fraction profile (Parton & Logan 1981)
+# Hourly temperature fraction profile (Schlenker & Roberts 2009; Snyder 1985)
 Tf <- 0.44 - 0.46 * sin((pi * seq(0.5, 23, 1)) / 12 + 0.9) +
       0.11 * sin((2 * pi * seq(0.5, 23, 1)) / 12 + 0.9)
 
@@ -279,6 +276,7 @@ soybeans_gs <- soybeans_gs %>%
   group_by(fips) %>%
   filter(n_distinct(year) >= 10) %>%
   ungroup()
+
 ```
 
 ---
@@ -291,6 +289,8 @@ counties_combined <- bind_rows(
   maize_gs    %>% select(fips, county_ansi, state_ansi),
   soybeans_gs %>% select(fips, county_ansi, state_ansi)
 ) %>% distinct()
+
+counties_combined <- counties_combined %>% filter(fips != "35031") # Exclude Hidalgo County, NM (missing growing season data)
 
 saveRDS(counties_combined, file = "input_data/counties_combined.rds")
 
@@ -311,9 +311,15 @@ soybeans_gs <- soybeans_gs %>%
 maize_gs    <- maize_gs    %>% mutate(prism_ppt_cm = prism_ppt / 10)
 soybeans_gs <- soybeans_gs %>% mutate(prism_ppt_cm = prism_ppt / 10)
 
+# Convert yields to MT/ha
+maize_gs <- maize_gs %>%
+  mutate(irr = irr * 0.0628, rainfed = rainfed * 0.0628)
+soybeans_gs <- soybeans_gs %>%
+  mutate(irr = irr * 0.0673, rainfed = rainfed * 0.0673)
+
+# Save and create crops list
 saveRDS(maize_gs,    file = "input_data/maize_gs")
 saveRDS(soybeans_gs, file = "input_data/soybeans_gs")
-
 crops <- list(corn = maize_gs, soybeans = soybeans_gs)
 ```
 
@@ -352,7 +358,7 @@ bootstrap_lm_state_year <- function(data, formula, n_boot = 1000,
 }
 ```
 
-```{r run-bootstrap}
+```{r run-bootstrap, eval=FALSE}
 boot_results <- list()
 
 for (crop_name in names(crops)) {
@@ -372,7 +378,7 @@ for (crop_name in names(crops)) {
     if (length(kdd_coefs) < 10) next
 
     boot_results[[length(boot_results) + 1]] <- data.frame(
-      Crop  = tools::toTitleCase(crop_name),
+      Crop  = ifelse(crop_name == "corn", "Maize", tools::toTitleCase(crop_name)),
       Type  = toupper(ifelse(water_type == "irr", "IRRIGATED", "RAINFED")),
       Mean  = mean(kdd_coefs),
       Lower = quantile(kdd_coefs, 0.025),
@@ -382,6 +388,45 @@ for (crop_name in names(crops)) {
 }
 
 boot_results_df <- bind_rows(boot_results)
+saveRDS(boot_results_df, file = "output_data/boot_results_df.rds")
+```
+
+#Adding new bookstrap chunk like the one above to save all of the coefficients from BSTRP other than KDD 
+```{r run-bootstrap-allcoef}
+boot_results <- list()
+
+for (crop_name in names(crops)) {
+  crop_data <- crops[[crop_name]]
+
+  for (water_type in c("rainfed", "irr")) {
+    if (!water_type %in% names(crop_data)) next
+
+    formula <- as.formula(paste0(
+      water_type,
+      " ~ KDD_sum_yearly + GDD_sum_yearly + prism_ppt_cm + I(prism_ppt_cm^2) +",
+      " county_factor + factor(year)"
+    ))
+
+    boot_df <- bootstrap_lm_state_year(crop_data, formula, n_boot)
+    
+    # ── NEW: save full bootstrap results for each model ──
+    saveRDS(boot_df, file = paste0("output_data/boot_full_", crop_name, "_", water_type, ".rds"))
+
+    kdd_coefs <- na.omit(boot_df$KDD_sum_yearly)
+    if (length(kdd_coefs) < 10) next
+
+    boot_results[[length(boot_results) + 1]] <- data.frame(
+      Crop  = ifelse(crop_name == "corn", "Maize", tools::toTitleCase(crop_name)),
+      Type  = toupper(ifelse(water_type == "irr", "IRRIGATED", "RAINFED")),
+      Mean  = mean(kdd_coefs),
+      Lower = quantile(kdd_coefs, 0.025),
+      Upper = quantile(kdd_coefs, 0.975)
+    )
+  }
+}
+
+boot_results_df <- bind_rows(boot_results)
+saveRDS(boot_results_df, file = "output_data/boot_results_df.rds")
 ```
 
 ```{r plot-bootstrap, fig.width=9, fig.height=6.5}
@@ -396,7 +441,7 @@ kdd_plot <- ggplot(boot_results_df, aes(x = Crop, y = Mean, color = Type)) +
   scale_color_manual(values = nice_colors) +
   labs(
     x     = expression(bold("Crop Type")),
-    y     = expression(bold(beta[1] ~ "(KDD)")),
+    y = expression(bold(beta[1] ~ "(KDD, MT/ha)")),
     color = NULL
   ) +
   theme_minimal(base_size = 18) +
@@ -421,7 +466,45 @@ ggsave(
   width    = 9, height = 6.5, dpi = 600
 )
 ```
+---
+##11.5 Ploting Boostrap KDD Coefs for AGU publication
+```{r plot-bootstrap-agu, fig.width=7.5, fig.height=4}
+boot_results_df <- readRDS("output_data/boot_results_df.rds")
 
+nice_colors <- c("IRRIGATED" = "#1f78b4", "RAINFED" = "#33a02c")
+
+kdd_plot <- ggplot(boot_results_df, aes(x = Crop, y = Mean, color = Type)) +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper),
+                width = 0.15, linewidth = 0.8,
+                position = position_dodge(width = 0.5)) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = "gray50", linewidth = 0.5) +
+  scale_color_manual(values = nice_colors) +
+  labs(
+    x     = expression(bold("Crop Type")),
+    y     = expression(bold(beta[1] ~ "(KDD, MT/ha)")),
+    color = NULL
+  ) +
+  theme_classic(base_size = 8) +
+  theme(
+    panel.border    = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    axis.title      = element_text(size = 8, family = "Helvetica"),
+    axis.text       = element_text(size = 7, family = "Helvetica"),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "right",
+    legend.text     = element_text(size = 7, family = "Helvetica"),
+    legend.key.size = unit(0.8, "lines")
+  )
+
+kdd_plot
+
+ggsave(
+  filename = "output_data/KDD_bootstrap_coefficients.png",
+  plot     = kdd_plot,
+  width    = 3.5, height = 3.5, dpi = 600, units = "in"
+)
+```
 ---
 
 ## 12. Export Regression Tables to Word
@@ -431,7 +514,7 @@ crop-by-irrigation combination.
 
 ```{r export-word-tables}
 library(officer)
-
+options(scipen = 999)
 coef_keep <- c(
   "KDD_sum_yearly",
   "GDD_sum_yearly",
@@ -456,7 +539,7 @@ get_stars <- function(ci_low, ci_high) {
 
 for (crop_name in names(crops)) {
   crop_data  <- crops[[crop_name]]
-  crop_title <- tools::toTitleCase(crop_name)
+  crop_title <- ifelse(crop_name == "corn", "Maize", tools::toTitleCase(crop_name))
 
   for (water_type in c("rainfed", "irr")) {
     if (!water_type %in% names(crop_data)) next
@@ -470,8 +553,7 @@ for (crop_name in names(crops)) {
     ))
 
     model   <- lm(formula, data = crop_data)
-    boot_df <- bootstrap_lm_state_year(crop_data, formula, n_boot,
-                                       state_var = "state_ansi", year_var = "year")
+    boot_df <- readRDS(paste0("output_data/boot_full_", crop_name, "_", water_type, ".rds"))
 
     coef_rows <- lapply(coef_keep, function(term) {
       if (!term %in% names(boot_df)) return(NULL)
@@ -483,8 +565,8 @@ for (crop_name in names(crops)) {
 
       data.frame(
         Predictor = pretty_labels[term],
-        Estimate  = paste0(round(coef(model)[term], 3), get_stars(ci_low, ci_high)),
-        `95% CI`  = paste0("[", round(ci_low, 3), ", ", round(ci_high, 3), "]"),
+        Estimate  = paste0(round(coef(model)[term], 4), get_stars(ci_low, ci_high)),
+        `95% CI`  = paste0("[", round(ci_low, 4), ", ", round(ci_high, 4), "]"),
         stringsAsFactors = FALSE
       )
     })
@@ -506,7 +588,7 @@ for (crop_name in names(crops)) {
       body_add_par(
         paste0("Notes: County and year fixed effects included. ",
                "95% CIs based on state-year block bootstrap (", n_boot, " replications). ",
-               "* p<0.05, ** p<0.01, *** p<0.001."),
+               "* CI excludes zero; ** |CI bound| > 0.05; *** |CI bound| > 0.1."),
         style = "Normal"
       )
 
