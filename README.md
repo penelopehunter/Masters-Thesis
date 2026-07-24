@@ -68,16 +68,6 @@ Scripts should be run in the following order. Each script depends on outputs fro
 
 ---
 
-## Key Notes
-
-- **Hidalgo County, NM (FIPS 35031)** is excluded from all analyses. Although this county has paired yield data, it lacks USDA NASS Crop Progress growing season dates for maize, resulting in all-NA climate variables downstream.
-- **Year fixed effect** is frozen at 2018 in all future projections to isolate climate impacts from technological trends.
-- **CO₂ fertilization** uses a Michaelis-Menten functional form with a 360 ppm preindustrial reference baseline, crop-specific parameters (maize: β = 10.82, A = 50 ppm; soybean: β = 17.20, A = 100 ppm), and SSP2-4.5 CO₂ concentrations interpolated between 400 ppm (2015) and 538 ppm (2100).
-- **Bootstrap inference** uses state-year block resampling with replacement in all scripts. Point estimates are taken from OLS regression on the full dataset; bootstrap distributions are used only for 95% confidence intervals.
-- All analyses were conducted in R using RStudio Version 2024.04.2+764.
-
----
-
 ## Data Sources
 
 - **PRISM climate data:** PRISM Climate Group, Oregon State University (https://prism.oregonstate.edu)
