@@ -367,7 +367,7 @@ co2_ssp245 <- data.frame(
   )$y
 )
 
-co2_fertilization <- function(co2_ppm, beta, A, baseline_ppm = 400) {
+co2_fertilization <- function(co2_ppm, beta, A, baseline_ppm = 360) {
   delta <- co2_ppm - baseline_ppm
   (beta * delta / (delta + A)) / 100
 }
