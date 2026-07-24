@@ -6,6 +6,7 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
+#all_trajectories <- readRDS("input_data/bootstrap_trajectories.rds")
 knitr::opts_chunk$set(echo = TRUE)
 library(dplyr)
 library(lubridate)
@@ -443,9 +444,10 @@ make_plot_bootstrap_ci <- function(df, crop_name, file_name) {
       labels = c("Irrigated" = "IRRIGATED", "Rainfed" = "RAINFED")
     ) +
     scale_x_continuous(
-      expand = c(0, 0),
-      breaks = c(min(df$year), 2050, 2100)
-    ) +
+  expand = c(0, 0),
+  breaks = c(2015, 2050, 2100),
+  limits = c(2014, 2101)   # small buffer so 2100 label isn't clipped
+)+
     scale_y_continuous(expand = c(0, 0)) +
     theme_classic(base_size = 16) +
     theme(
@@ -455,8 +457,8 @@ make_plot_bootstrap_ci <- function(df, crop_name, file_name) {
       axis.title       = element_text(face = "bold", size = 16),
       axis.text        = element_text(size = 14),
       plot.title       = element_text(face = "bold", size = 18, hjust = 0.5),
-      axis.line        = element_line(size = 0.8),
-      panel.border     = element_rect(color = "black", fill = NA, size = 0.8)
+      axis.line        = element_line(linewidth = 0.8),
+      panel.border     = element_rect(color = "black", fill = NA, linewidth = 0.8)
     ) +
     labs(
       x     = "Year",
@@ -490,27 +492,23 @@ soy_ci_plot
 compute_yield_change_bootstrap <- function(summary_df, crop, type_label) {
   df <- summary_df %>% filter(Type == type_label) %>% arrange(year)
 
-  years      <- sort(unique(df$year))
-  first_years <- years[1:20]
-  last_years  <- tail(years, 20)
-
-  first_mean <- df %>%
-    filter(year %in% first_years) %>%
+  start_mean <- df %>%
+    filter(year %in% 2015:2024) %>%
     summarise(m = mean(mean_yield, na.rm = TRUE)) %>%
     pull(m)
 
-  last_mean  <- df %>%
-    filter(year %in% last_years) %>%
+  end_mean <- df %>%
+    filter(year %in% 2091:2100) %>%
     summarise(m = mean(mean_yield, na.rm = TRUE)) %>%
     pull(m)
 
   data.frame(
     Crop        = crop,
     Type        = type_label,
-    First20_mean = round(first_mean, 2),
-    Last20_mean  = round(last_mean,  2),
-    Abs_change   = round(last_mean - first_mean, 2),
-    Pct_change   = round(((last_mean - first_mean) / first_mean) * 100, 2)
+    Start_Yield = round(start_mean, 2),
+    End_Yield   = round(end_mean,   2),
+    Abs_Change  = round(end_mean - start_mean, 2),
+    Pct_Change  = round(((end_mean - start_mean) / start_mean) * 100, 2)
   )
 }
 
@@ -528,7 +526,7 @@ print(yield_change_table)
 # 10. SPAGHETTI PLOT: All 5000 trajectories + central mean line
 # ============================================================
 
-```{r yield-spaghetti-plot}
+```{r yield-spaghetti-plot, eval=FALSE}
 
 make_spaghetti_plot <- function(traj_df, summary_df, crop_name, file_name) {
   
@@ -559,9 +557,10 @@ make_spaghetti_plot <- function(traj_df, summary_df, crop_name, file_name) {
       labels = c("Irrigated" = "IRRIGATED", "Rainfed" = "RAINFED")
     ) +
     scale_x_continuous(
-      expand = c(0, 0),
-      breaks = c(2015, 2050, 2100)
-    ) +
+  expand = c(0, 0),
+  breaks = c(2015, 2050, 2100),
+  limits = c(2014, 2101)   # small buffer so 2100 label isn't clipped
+)+
     scale_y_continuous(expand = c(0, 0)) +
     theme_classic(base_size = 16) +
     theme(
@@ -587,21 +586,12 @@ make_spaghetti_plot <- function(traj_df, summary_df, crop_name, file_name) {
 corn_traj_combined <- bind_rows(
   all_trajectories$corn_irrig %>% mutate(Type = "Irrigated"),
   all_trajectories$corn_rain  %>% mutate(Type = "Rainfed")
-) %>%
-  left_join(co2_ssp245 %>% select(year, co2_mult_maize),
-            by = c("cip_year" = "year")) %>%
-  mutate(mean_yield = mean_yield * co2_mult_maize) %>%
-  select(-co2_mult_maize)
+)
 
 soy_traj_combined <- bind_rows(
   all_trajectories$soy_irrig %>% mutate(Type = "Irrigated"),
   all_trajectories$soy_rain  %>% mutate(Type = "Rainfed")
-) %>%
-  left_join(co2_ssp245 %>% select(year, co2_mult_soy),
-            by = c("cip_year" = "year")) %>%
-  mutate(mean_yield = mean_yield * co2_mult_soy) %>%
-  select(-co2_mult_soy)
-
+) 
 # Plot — these may take a minute to render with 5000 lines each
 corn_spaghetti <- make_spaghetti_plot(
   corn_traj_combined, corn_summary,
@@ -616,89 +606,89 @@ soy_spaghetti <- make_spaghetti_plot(
 corn_spaghetti
 soy_spaghetti
 ```
-```{r yield-spaghetti-plot-publication}
-library(patchwork)
 
-make_spaghetti_plot <- function(traj_df, summary_df, crop_name, panel_letter) {
-  
-  cols <- c("Irrigated" = "#1f78b4", "Rainfed" = "#33a02c")
-  
+```{r yield-spaghetti-plot-publication-draft, eval=FALSE}
+library(patchwork)
+make_spaghetti_plot <- function(traj_df, summary_df, crop_name,
+                                panel_letter, y_label) {
   ggplot() +
     geom_line(
       data = traj_df,
-      aes(x = cip_year, y = mean_yield, 
+      aes(x     = cip_year,
+          y     = mean_yield,
           group = interaction(boot_iter, gcm, Type),
           color = Type),
-      alpha = 0.005,
-      linewidth = 0.3
+      alpha     = 0.015,
+      linewidth = 0.15
     ) +
     geom_line(
-      data = summary_df,
-      aes(x = year, y = mean_yield,
-          color = Type, group = Type),
-      linewidth = 1.8
+      data      = summary_df,
+      aes(x     = year,
+          y     = mean_yield,
+          color = Type,
+          group = Type),
+      linewidth = 0.8
     ) +
     scale_color_manual(
-      values = cols,
+      values = c("Irrigated" = "#1f78b4", "Rainfed" = "#33a02c"),
       labels = c("Irrigated" = "IRRIGATED", "Rainfed" = "RAINFED")
     ) +
     scale_x_continuous(
-      expand = expansion(mult = c(0, 0.02)),
+      expand = c(0, 0),
       breaks = c(2015, 2050, 2100),
       limits = c(2015, 2100)
     ) +
     scale_y_continuous(expand = c(0, 0)) +
-    theme_classic(base_size = 8) +
+    theme_classic(base_size = 8, base_family = "Helvetica") +
     theme(
-      legend.position  = "bottom",
-      legend.title     = element_blank(),
-      legend.text      = element_text(size = 8, family = "Helvetica"),
-      axis.title       = element_text(size = 8, family = "Helvetica"),
-      axis.text        = element_text(size = 7, family = "Helvetica"),
-      plot.title       = element_text(size = 8, face = "bold",
-                                      hjust = 0, family = "Helvetica"),
-      axis.line        = element_line(linewidth = 0.5),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA),
       panel.border     = element_rect(color = "black", fill = NA,
                                       linewidth = 0.5),
-      plot.margin      = margin(4, 8, 4, 4, "pt")
-    ) +
+      panel.grid       = element_blank(),
+      legend.position  = "bottom",
+      legend.title     = element_blank(),
+      legend.text      = element_text(size = 7, family = "Helvetica"),
+      axis.title       = element_text(size = 8, family = "Helvetica"),
+      axis.text        = element_text(size = 7, family = "Helvetica"),
+      plot.title       = element_text(size = 8, face = "plain",
+                                      hjust = 0, family = "Helvetica"),
+      axis.line        = element_line(linewidth = 0.5),
+      plot.margin = margin(4, 10, 4, 4, "pt")  # slight extra right margin
+      ) +
+    coord_cartesian(xlim = c(2015, 2100), clip = "off")+
     labs(
+      title = panel_letter,
       x     = "Year",
-      y     = "Predicted Yield (MT/ha)",
-      title = paste0("(", panel_letter, ") ", crop_name)
+      y     = y_label
     )
 }
 
-# Prepare trajectory data frames with CO2 adjustment only (already in MT/ha)
+# Prepare trajectory data
 corn_traj_combined <- bind_rows(
   all_trajectories$corn_irrig %>% mutate(Type = "Irrigated"),
   all_trajectories$corn_rain  %>% mutate(Type = "Rainfed")
-) %>%
-  left_join(co2_ssp245 %>% select(year, co2_mult_maize),
-            by = c("cip_year" = "year")) %>%
-  mutate(mean_yield = mean_yield * co2_mult_maize) %>%
-  select(-co2_mult_maize)
+)
 
 soy_traj_combined <- bind_rows(
   all_trajectories$soy_irrig %>% mutate(Type = "Irrigated"),
   all_trajectories$soy_rain  %>% mutate(Type = "Rainfed")
-) %>%
-  left_join(co2_ssp245 %>% select(year, co2_mult_soy),
-            by = c("cip_year" = "year")) %>%
-  mutate(mean_yield = mean_yield * co2_mult_soy) %>%
-  select(-co2_mult_soy)
+)
 
-# Build individual panels
-p_maize <- make_spaghetti_plot(corn_traj_combined, corn_summary, "Maize", "a")
-p_soy   <- make_spaghetti_plot(soy_traj_combined,  soy_summary,  "Soy",   "b")
+# Build panels
+p_maize <- make_spaghetti_plot(
+  corn_traj_combined, corn_summary,
+  "Maize", "a", "Maize Yield (MT/ha)"
+) + theme(legend.position = "none")
 
-# Apply shared legend theme to each panel individually before combining
-p_maize <- p_maize + theme(legend.position = "bottom")
-p_soy   <- p_soy   + theme(legend.position = "bottom")
+p_soy <- make_spaghetti_plot(
+  soy_traj_combined, soy_summary,
+  "Soy", "b", "Soybean Yield (MT/ha)"
+) + theme(legend.position = "bottom")
 
-# Combine and save as single figure
+# Combine
 p_combined <- (p_maize / p_soy) +
-  plot_layout(guides = "collect")
+  plot_layout(guides = "collect") & theme(legend.position = "bottom")
 
 ggsave(
   "output_data/spaghetti_combined.png",
@@ -706,8 +696,105 @@ ggsave(
   width  = 7.5,
   height = 6,
   dpi    = 600,
-  units  = "in"
+  units  = "in",
+  bg     = "white"
 )
 
 p_combined
 ```
+
+```{r yield-spaghetti-plot-publication}
+#library(patchwork)
+make_spaghetti_plot <- function(traj_df, summary_df, crop_name,
+                                panel_letter, y_label) {
+  ggplot() +
+    geom_line(
+      data = traj_df,
+      aes(x     = cip_year,
+          y     = mean_yield,
+          group = interaction(boot_iter, gcm, Type),
+          color = Type),
+      alpha     = 0.004,
+      linewidth = 0.15
+    ) +
+    geom_line(
+      data      = summary_df,
+      aes(x     = year,
+          y     = mean_yield,
+          color = Type,
+          group = Type),
+      linewidth = 0.8
+    ) +
+    scale_color_manual(
+      values = c("Irrigated" = "#1f78b4", "Rainfed" = "#33a02c"),
+      labels = c("Irrigated" = "IRRIGATED", "Rainfed" = "RAINFED")
+    ) +
+    scale_x_continuous(
+      expand = c(0, 0),
+      breaks = c(2015, 2050, 2100),
+      limits = c(2014, 2101)
+    ) +
+    scale_y_continuous(expand = c(0, 0)) +
+    theme_classic(base_size = 8, base_family = "Helvetica") +
+    theme(
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.border     = element_rect(color = "black", fill = NA,
+                                      linewidth = 0.5),
+      panel.grid       = element_blank(),
+      legend.position  = "bottom",
+      legend.title     = element_blank(),
+      legend.text      = element_text(size = 7, family = "Helvetica"),
+      axis.title       = element_text(size = 8, family = "Helvetica"),
+      axis.text        = element_text(size = 7, family = "Helvetica"),
+      plot.title       = element_text(size = 8, face = "plain",
+                                      hjust = 0, family = "Helvetica"),
+      axis.line        = element_line(linewidth = 0.5),
+      plot.margin      = margin(4, 8, 4, 4, "pt")
+    ) +
+    labs(
+      title = panel_letter,
+      x     = "Year",
+      y     = y_label
+    )
+}
+
+# Prepare trajectory data
+corn_traj_combined <- bind_rows(
+  all_trajectories$corn_irrig %>% mutate(Type = "Irrigated"),
+  all_trajectories$corn_rain  %>% mutate(Type = "Rainfed")
+)
+
+soy_traj_combined <- bind_rows(
+  all_trajectories$soy_irrig %>% mutate(Type = "Irrigated"),
+  all_trajectories$soy_rain  %>% mutate(Type = "Rainfed")
+)
+
+# Build panels
+p_maize <- make_spaghetti_plot(
+  corn_traj_combined, corn_summary,
+  "Maize", "a", "Maize Yield (MT/ha)"
+) + theme(legend.position = "none")
+
+p_soy <- make_spaghetti_plot(
+  soy_traj_combined, soy_summary,
+  "Soy", "b", "Soybean Yield (MT/ha)"
+) + theme(legend.position = "bottom")
+
+# Combine
+p_combined <- (p_maize / p_soy) +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+ggsave(
+  "output_data/spaghetti_combined.png",
+  p_combined,
+  width  = 7.5,
+  height = 6,
+  dpi    = 600,
+  units  = "in",
+  bg     = "white"
+)
+
+p_combined
+```
+
