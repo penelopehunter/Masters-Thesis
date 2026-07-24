@@ -9,8 +9,12 @@ output:
     theme: flatly
     highlight: tango
     code_folding: hide
+    
 ---
-
+# NOTE: This script is an earlier version of the projection analysis.
+# The final analysis with full bootstrap uncertainty propagation is in
+# bootstrap_yield_projections.Rmd, which supersedes this script.
+# Retained for reference only.
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(
   echo    = TRUE,
@@ -262,12 +266,12 @@ minimum, and maximum are derived across GCMs to represent projection
 uncertainty.
 
 ```{r summarize-gcms}
-summarize_yield_gcms <- function(gcm_list, model) {
+summarize_yield_gcms <- function(gcm_list, model, bu_to_mt) {
   gcm_means <- lapply(seq_along(gcm_list), function(i) {
     df   <- gcm_list[[i]]
     pred <- predict(model, newdata = df)
     df %>%
-      mutate(predicted_yield = pmax(pred, 0)) %>%
+      mutate(predicted_yield = pmax(pred, 0) * bu_to_mt) %>%  # convert here
       group_by(cip_year) %>%
       summarise(mean_yield_gcm = mean(predicted_yield, na.rm = TRUE),
                 .groups = "drop") %>%
@@ -287,13 +291,13 @@ summarize_yield_gcms <- function(gcm_list, model) {
 }
 
 corn_df <- bind_rows(
-  summarize_yield_gcms(lapply(results, \(x) x$maize$irrigated), model_maize_irrig) %>% mutate(Type = "Irrigated"),
-  summarize_yield_gcms(lapply(results, \(x) x$maize$rainfed),   model_maize_rain)  %>% mutate(Type = "Rainfed")
+  summarize_yield_gcms(lapply(results, \(x) x$maize$irrigated), model_maize_irrig, bu_to_mt = 0.0628) %>% mutate(Type = "Irrigated"),
+  summarize_yield_gcms(lapply(results, \(x) x$maize$rainfed),   model_maize_rain,  bu_to_mt = 0.0628) %>% mutate(Type = "Rainfed")
 )
 
 soy_df <- bind_rows(
-  summarize_yield_gcms(lapply(results, \(x) x$soy$irrigated), model_soy_irrig) %>% mutate(Type = "Irrigated"),
-  summarize_yield_gcms(lapply(results, \(x) x$soy$rainfed),   model_soy_rain)  %>% mutate(Type = "Rainfed")
+  summarize_yield_gcms(lapply(results, \(x) x$soy$irrigated), model_soy_irrig, bu_to_mt = 0.0673) %>% mutate(Type = "Irrigated"),
+  summarize_yield_gcms(lapply(results, \(x) x$soy$rainfed),   model_soy_rain,  bu_to_mt = 0.0673) %>% mutate(Type = "Rainfed")
 )
 ```
 
@@ -319,7 +323,7 @@ make_plot_minmax <- function(df, crop_name, file_name) {
     scale_x_continuous(expand = c(0, 0),
                        breaks = c(min(df$year), 2050, 2100)) +
     scale_y_continuous(expand = c(0, 0)) +
-    labs(x = "Year", y = "Predicted Yield (bu/ac)", title = crop_name) +
+    labs(x = "Year", y = "Predicted Yield (MT/ha)", title = crop_name) +
     theme_classic(base_size = 16) +
     theme(
       legend.position = "bottom",
@@ -338,7 +342,7 @@ make_plot_minmax <- function(df, crop_name, file_name) {
 ```
 
 ```{r save-plots, fig.width=8, fig.height=4.5}
-make_plot_minmax(corn_df, "Corn", "output_data/corn_plot_minmax.png")
+make_plot_minmax(corn_df, "Maize", "output_data/corn_plot_minmax.png")
 make_plot_minmax(soy_df,  "Soy",  "output_data/soy_plot_minmax.png")
 ```
 
