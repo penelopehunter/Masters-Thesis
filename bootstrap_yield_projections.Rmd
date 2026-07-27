@@ -485,7 +485,7 @@ soy_ci_plot
 
 
 # ============================================================
-# 9. YIELD CHANGE TABLE (first 20 vs last 20 years of projections)
+# 9. YIELD CHANGE TABLE (first 10 vs last 10 years of projections)
 # ============================================================
 
 ```{r yield-change-table}
@@ -704,6 +704,7 @@ p_combined
 ```
 
 ```{r yield-spaghetti-plot-publication}
+
 #library(patchwork)
 make_spaghetti_plot <- function(traj_df, summary_df, crop_name,
                                 panel_letter, y_label) {
@@ -732,9 +733,10 @@ make_spaghetti_plot <- function(traj_df, summary_df, crop_name,
     scale_x_continuous(
       expand = c(0, 0),
       breaks = c(2015, 2050, 2100),
-      limits = c(2014, 2101)
+      limits = c(2015, 2100)
     ) +
     scale_y_continuous(expand = c(0, 0)) +
+    coord_cartesian(xlim = c(2015, 2100), clip = "off") +
     theme_classic(base_size = 8, base_family = "Helvetica") +
     theme(
       panel.background = element_rect(fill = "white", color = NA),
@@ -782,8 +784,7 @@ p_soy <- make_spaghetti_plot(
 ) + theme(legend.position = "bottom")
 
 # Combine
-p_combined <- (p_maize / p_soy) +
-  plot_layout(guides = "collect") & theme(legend.position = "bottom")
+p_combined <- (p_maize / p_soy)
 
 ggsave(
   "output_data/spaghetti_combined.png",
