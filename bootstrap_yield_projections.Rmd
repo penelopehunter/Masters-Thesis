@@ -523,6 +523,138 @@ print(yield_change_table)
 ```
 
 # ============================================================
+# 9B. YIELD CHANGE: ALTERNATIVE ENDPOINT METHODS (comparison)
+# ============================================================
+# Three alternative ways to derive the same percent change, reported
+# alongside the decadal-average result above for methods comparison.
+#   Method A (section 9): mean(2015-2024) vs mean(2091-2100)
+#   Method B: linear trend fit to the mean line, read at 2015 and 2100
+#   Method C: single first year vs single last year
+#   Method D: Method A computed per trajectory, giving a 95% CI
+# All summary_df inputs are already CO2-adjusted (section 7).
+
+```{r yield-change-method-comparison}
+# ---- Method B: linear trend fit, endpoints read off the fitted line ----
+compute_yield_change_trendfit <- function(summary_df, crop, type_label) {
+  df <- summary_df %>% filter(Type == type_label) %>% arrange(year)
+
+  trend_fit <- lm(mean_yield ~ year, data = df)
+
+  fitted_ends <- predict(trend_fit, newdata = data.frame(year = c(2015, 2100)))
+  start_fit   <- fitted_ends[[1]]
+  end_fit     <- fitted_ends[[2]]
+
+  data.frame(
+    Crop        = crop,
+    Type        = type_label,
+    Start_Yield = round(start_fit, 2),
+    End_Yield   = round(end_fit,   2),
+    Abs_Change  = round(end_fit - start_fit, 2),
+    Pct_Change  = round(((end_fit - start_fit) / start_fit) * 100, 2),
+    Trend_R2    = round(summary(trend_fit)$r.squared, 3)
+  )
+}
+
+# ---- Method C: single first and last projection year ----
+compute_yield_change_singleyear <- function(summary_df, crop, type_label) {
+  df <- summary_df %>% filter(Type == type_label) %>% arrange(year)
+
+  start_yr <- df %>% filter(year == 2015) %>% pull(mean_yield)
+  end_yr   <- df %>% filter(year == 2100) %>% pull(mean_yield)
+
+  data.frame(
+    Crop        = crop,
+    Type        = type_label,
+    Start_Yield = round(start_yr, 2),
+    End_Yield   = round(end_yr,   2),
+    Abs_Change  = round(end_yr - start_yr, 2),
+    Pct_Change  = round(((end_yr - start_yr) / start_yr) * 100, 2)
+  )
+}
+
+trendfit_change_table <- bind_rows(
+  compute_yield_change_trendfit(corn_summary, "Maize", "Irrigated"),
+  compute_yield_change_trendfit(corn_summary, "Maize", "Rainfed"),
+  compute_yield_change_trendfit(soy_summary,  "Soy",  "Irrigated"),
+  compute_yield_change_trendfit(soy_summary,  "Soy",  "Rainfed")
+)
+
+singleyear_change_table <- bind_rows(
+  compute_yield_change_singleyear(corn_summary, "Maize", "Irrigated"),
+  compute_yield_change_singleyear(corn_summary, "Maize", "Rainfed"),
+  compute_yield_change_singleyear(soy_summary,  "Soy",  "Irrigated"),
+  compute_yield_change_singleyear(soy_summary,  "Soy",  "Rainfed")
+)
+
+print(trendfit_change_table)
+print(singleyear_change_table)
+```
+
+```{r yield-change-ci}
+# ---- Method D: decadal-average change computed per trajectory ----
+# Yields the distribution of percent change across all trajectories,
+# so the reported change carries a 95% CI rather than a bare point estimate.
+# Operates on raw trajectories, so CO2 fertilization is applied here.
+compute_yield_change_ci <- function(traj_df, crop, type_label, co2_col) {
+  traj_pct <- traj_df %>%
+    rename(year = cip_year) %>%
+    left_join(co2_ssp245 %>% select(year, all_of(co2_col)), by = "year") %>%
+    mutate(adj_yield = mean_yield * .data[[co2_col]]) %>%
+    group_by(boot_iter, gcm) %>%
+    summarise(
+      start_mean = mean(adj_yield[year %in% 2015:2024], na.rm = TRUE),
+      end_mean   = mean(adj_yield[year %in% 2091:2100], na.rm = TRUE),
+      .groups    = "drop"
+    ) %>%
+    mutate(pct = ((end_mean - start_mean) / start_mean) * 100)
+
+  pct_ci <- quantile(traj_pct$pct, c(0.025, 0.5, 0.975), na.rm = TRUE)
+
+  data.frame(
+    Crop       = crop,
+    Type       = type_label,
+    Pct_Median = round(pct_ci[[2]], 2),
+    Pct_Lower  = round(pct_ci[[1]], 2),
+    Pct_Upper  = round(pct_ci[[3]], 2),
+    N_Traj     = nrow(traj_pct)
+  )
+}
+
+yield_change_ci_table <- bind_rows(
+  compute_yield_change_ci(all_trajectories$corn_irrig, "Maize", "Irrigated", "co2_mult_maize"),
+  compute_yield_change_ci(all_trajectories$corn_rain,  "Maize", "Rainfed",   "co2_mult_maize"),
+  compute_yield_change_ci(all_trajectories$soy_irrig,  "Soy",  "Irrigated", "co2_mult_soy"),
+  compute_yield_change_ci(all_trajectories$soy_rain,   "Soy",  "Rainfed",   "co2_mult_soy")
+)
+
+print(yield_change_ci_table)
+```
+
+```{r yield-change-all-methods}
+# ---- Side-by-side comparison of all four methods ----
+all_methods_table <- yield_change_table %>%
+  select(Crop, Type, A_Decadal = Pct_Change) %>%
+  left_join(
+    trendfit_change_table %>% select(Crop, Type, B_TrendFit = Pct_Change, Trend_R2),
+    by = c("Crop", "Type")
+  ) %>%
+  left_join(
+    singleyear_change_table %>% select(Crop, Type, C_SingleYear = Pct_Change),
+    by = c("Crop", "Type")
+  ) %>%
+  left_join(
+    yield_change_ci_table %>% select(Crop, Type, D_Lower = Pct_Lower, D_Upper = Pct_Upper),
+    by = c("Crop", "Type")
+  ) %>%
+  mutate(
+    B_minus_A = round(B_TrendFit - A_Decadal, 2),
+    C_minus_A = round(C_SingleYear - A_Decadal, 2)
+  )
+
+print(all_methods_table)
+```
+
+# ============================================================
 # 10. SPAGHETTI PLOT: All 5000 trajectories + central mean line
 # ============================================================
 
