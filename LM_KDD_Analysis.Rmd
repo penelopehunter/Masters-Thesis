@@ -311,7 +311,7 @@ soybeans_gs <- soybeans_gs %>%
 maize_gs    <- maize_gs    %>% mutate(prism_ppt_cm = prism_ppt / 10)
 soybeans_gs <- soybeans_gs %>% mutate(prism_ppt_cm = prism_ppt / 10)
 
-# Convert yields to MT/ha
+# Convert yields to t/ha
 maize_gs <- maize_gs %>%
   mutate(irr = irr * 0.0628, rainfed = rainfed * 0.0628)
 soybeans_gs <- soybeans_gs %>%
@@ -441,7 +441,7 @@ kdd_plot <- ggplot(boot_results_df, aes(x = Crop, y = Mean, color = Type)) +
   scale_color_manual(values = nice_colors) +
   labs(
     x     = expression(bold("Crop Type")),
-    y = expression(bold(beta[1] ~ "(KDD, MT/ha)")),
+    y = expression(bold(beta[1] ~ "(KDD, t/ha)")),
     color = NULL
   ) +
   theme_minimal(base_size = 18) +
@@ -483,7 +483,7 @@ kdd_plot <- ggplot(boot_results_df, aes(x = Crop, y = Mean, color = Type)) +
   scale_color_manual(values = nice_colors) +
   labs(
     x     = expression(bold("Crop Type")),
-    y     = expression(bold(beta[1] ~ "(KDD, MT/ha)")),
+    y     = expression(bold(beta[1] ~ "(KDD, t/ha)")),
     color = NULL
   ) +
   theme_classic(base_size = 8) +

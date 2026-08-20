@@ -378,7 +378,7 @@ co2_ssp245 <- co2_ssp245 %>%
     co2_mult_soy   = exp(co2_fertilization(co2_ppm, beta = 17.20, A = 100))
   )
 
-# Summarise trajectories and apply CO2 fertilization (yields already in MT/ha)
+# Summarise trajectories and apply CO2 fertilization (yields already in t/ha)
 summarise_trajectories <- function(traj_df) {
   traj_df %>%
     rename(traj_yield = mean_yield) %>%
@@ -462,7 +462,7 @@ make_plot_bootstrap_ci <- function(df, crop_name, file_name) {
     ) +
     labs(
       x     = "Year",
-      y     = "Predicted Yield (MT/ha)",
+      y     = "Predicted Yield (t/ha)",
       title = paste0(crop_name, " — Bootstrap 95% CI (n = 5,000 trajectories)")
     )
 
@@ -707,7 +707,7 @@ make_spaghetti_plot <- function(traj_df, summary_df, crop_name, file_name) {
     ) +
     labs(
       x     = "Year",
-      y     = "Predicted Yield (MT/ha)",
+      y     = "Predicted Yield (t/ha)",
       title = paste0(crop_name, " — Bootstrap Trajectories (n = 5,000)")
     )
   
@@ -715,15 +715,26 @@ make_spaghetti_plot <- function(traj_df, summary_df, crop_name, file_name) {
   p
 }
 
+# CO2 fertilization applied here so the individual trajectory lines are on the
+# same scale as the CO2-adjusted mean lines in corn_summary / soy_summary
 corn_traj_combined <- bind_rows(
   all_trajectories$corn_irrig %>% mutate(Type = "Irrigated"),
   all_trajectories$corn_rain  %>% mutate(Type = "Rainfed")
-)
+) %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_maize),
+            by = c("cip_year" = "year")) %>%
+  mutate(mean_yield = mean_yield * co2_mult_maize) %>%
+  select(-co2_mult_maize)
 
 soy_traj_combined <- bind_rows(
   all_trajectories$soy_irrig %>% mutate(Type = "Irrigated"),
   all_trajectories$soy_rain  %>% mutate(Type = "Rainfed")
-) 
+) %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_soy),
+            by = c("cip_year" = "year")) %>%
+  mutate(mean_yield = mean_yield * co2_mult_soy) %>%
+  select(-co2_mult_soy)
+
 # Plot — these may take a minute to render with 5000 lines each
 corn_spaghetti <- make_spaghetti_plot(
   corn_traj_combined, corn_summary,
@@ -797,25 +808,35 @@ make_spaghetti_plot <- function(traj_df, summary_df, crop_name,
 }
 
 # Prepare trajectory data
+# CO2 fertilization applied here so the individual trajectory lines are on the
+# same scale as the CO2-adjusted mean lines in corn_summary / soy_summary
 corn_traj_combined <- bind_rows(
   all_trajectories$corn_irrig %>% mutate(Type = "Irrigated"),
   all_trajectories$corn_rain  %>% mutate(Type = "Rainfed")
-)
+) %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_maize),
+            by = c("cip_year" = "year")) %>%
+  mutate(mean_yield = mean_yield * co2_mult_maize) %>%
+  select(-co2_mult_maize)
 
 soy_traj_combined <- bind_rows(
   all_trajectories$soy_irrig %>% mutate(Type = "Irrigated"),
   all_trajectories$soy_rain  %>% mutate(Type = "Rainfed")
-)
+) %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_soy),
+            by = c("cip_year" = "year")) %>%
+  mutate(mean_yield = mean_yield * co2_mult_soy) %>%
+  select(-co2_mult_soy)
 
 # Build panels
 p_maize <- make_spaghetti_plot(
   corn_traj_combined, corn_summary,
-  "Maize", "a", "Maize Yield (MT/ha)"
+  "Maize", "a", "Maize Yield (t/ha)"
 ) + theme(legend.position = "none")
 
 p_soy <- make_spaghetti_plot(
   soy_traj_combined, soy_summary,
-  "Soy", "b", "Soybean Yield (MT/ha)"
+  "Soy", "b", "Soybean Yield (t/ha)"
 ) + theme(legend.position = "bottom")
 
 # Combine
@@ -847,7 +868,7 @@ make_spaghetti_plot <- function(traj_df, summary_df, crop_name,
           y     = mean_yield,
           group = interaction(boot_iter, gcm, Type),
           color = Type),
-      alpha     = 0.004,
+      alpha     = 0.015,
       linewidth = 0.15
     ) +
     geom_line(
@@ -894,25 +915,35 @@ make_spaghetti_plot <- function(traj_df, summary_df, crop_name,
 }
 
 # Prepare trajectory data
+# CO2 fertilization applied here so the individual trajectory lines are on the
+# same scale as the CO2-adjusted mean lines in corn_summary / soy_summary
 corn_traj_combined <- bind_rows(
   all_trajectories$corn_irrig %>% mutate(Type = "Irrigated"),
   all_trajectories$corn_rain  %>% mutate(Type = "Rainfed")
-)
+) %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_maize),
+            by = c("cip_year" = "year")) %>%
+  mutate(mean_yield = mean_yield * co2_mult_maize) %>%
+  select(-co2_mult_maize)
 
 soy_traj_combined <- bind_rows(
   all_trajectories$soy_irrig %>% mutate(Type = "Irrigated"),
   all_trajectories$soy_rain  %>% mutate(Type = "Rainfed")
-)
+) %>%
+  left_join(co2_ssp245 %>% select(year, co2_mult_soy),
+            by = c("cip_year" = "year")) %>%
+  mutate(mean_yield = mean_yield * co2_mult_soy) %>%
+  select(-co2_mult_soy)
 
 # Build panels
 p_maize <- make_spaghetti_plot(
   corn_traj_combined, corn_summary,
-  "Maize", "a", "Maize Yield (MT/ha)"
+  "Maize", "a", "Maize Yield (t/ha)"
 ) + theme(legend.position = "none")
 
 p_soy <- make_spaghetti_plot(
   soy_traj_combined, soy_summary,
-  "Soy", "b", "Soybean Yield (MT/ha)"
+  "Soy", "b", "Soybean Yield (t/ha)"
 ) + theme(legend.position = "bottom")
 
 # Combine
@@ -921,8 +952,8 @@ p_combined <- (p_maize / p_soy)
 ggsave(
   "output_data/spaghetti_combined.png",
   p_combined,
-  width  = 7.5,
-  height = 6,
+  width  = 6.5,
+  height = 7,
   dpi    = 600,
   units  = "in",
   bg     = "white"
